@@ -1,5 +1,5 @@
 const $ = (id) => document.getElementById(id);
-const state = { tasks: [], selected: null, plans: new Map(), action: null, editTask: null, connected: true, lastSuccessAt: null, graph: null };
+const state = { tasks: [], selected: null, plans: new Map(), action: null, editTask: null, connected: true, hasLoadedTasks: false, lastSuccessAt: null, graph: null };
 
 function esc(value) {
   return String(value ?? "").replace(/[&<>"']/g, (ch) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[ch]));
@@ -37,15 +37,17 @@ async function api(path, options = {}) {
 async function refresh(keep = true) {
   try {
     const data = await api("/api/tasks"); state.tasks = data.tasks || [];
-    state.connected = true; state.lastSuccessAt = new Date().toISOString();
+    state.connected = true; state.hasLoadedTasks = true; state.lastSuccessAt = new Date().toISOString();
     $("taskCount").textContent = state.tasks.length;
     renderMetrics(); renderRows();
     if (state.selected && keep && state.tasks.some(x => x.task_id === state.selected)) await selectTask(state.selected);
     else if (!state.selected) $("detailPanel").innerHTML = placeholder();
     renderGraph();
   } catch (error) {
-    // 保留已有数据，但标记断连并显示旧的最后成功时间；不把旧数据当成新鲜。
+    // 保留已有数据，但区分“从未成功加载”与“已有数据后断线”：不把未知当成空。
     state.connected = false;
+    $("taskCount").textContent = state.hasLoadedTasks ? state.tasks.length : "—";
+    renderMetrics(); renderRows();
     renderGraph();
     toast(error.message, true);
   }
@@ -53,7 +55,7 @@ async function refresh(keep = true) {
 function renderGraph() {
   updateConnection();
   if (!state.graph) return;
-  state.graph.update(state.tasks);
+  state.graph.update(state.tasks, state.hasLoadedTasks);
   state.graph.setFilter($("searchInput").value);
   if (state.selected) state.graph.select(state.selected);
   state.graph.setConnection(state.connected, state.lastSuccessAt);
@@ -84,6 +86,12 @@ function initGraph() {
   }
 }
 function renderMetrics() {
+  if (!state.hasLoadedTasks) {
+    // 从未成功读取任务：计数未知，显示“—”而不是 0，避免把未知当成空。
+    const unknown = [["任务总数","—","尚未成功读取","◫"],["正在执行","—","尚未成功读取","↗"],["等待审查","—","尚未成功读取","◇"],["验收阻塞","—","尚未成功读取","! "]];
+    $("metrics").innerHTML = unknown.map(([title,value,sub,icon]) => `<article class="metric"><div class="metric-top"><span>${title}</span><span class="metric-icon">${icon}</span></div><div class="metric-value">${value}</div><div class="metric-sub">${sub}</div></article>`).join("");
+    return;
+  }
   const counts = {all:state.tasks.length,active:0,review:0,blocked:0};
   for (const row of state.tasks) {
     if (["running","cancel_requested"].includes(row.state.status)) counts.active++;
@@ -96,7 +104,12 @@ function renderMetrics() {
 function renderRows() {
   const query = $("searchInput").value.trim().toLowerCase();
   const rows = state.tasks.filter(x => `${x.task_id} ${x.task.goal}`.toLowerCase().includes(query));
+  // 表格空态与图、文本列表遵循同一判别：从未成功加载 ≠ 成功加载且确为空。
+  const unknown = !state.hasLoadedTasks;
   $("emptyState").classList.toggle("visible", state.tasks.length === 0);
+  $("emptyTitle").textContent = unknown ? "无法读取任务" : "还没有任务";
+  $("emptyHint").textContent = unknown ? "尚未成功加载任务列表；无法确认任务是否为空。请等待重试或检查本机连接。" : "创建任务契约后，可在这里规划、执行和审查。";
+  $("emptyNewButton").hidden = unknown;
   $("taskRows").innerHTML = rows.map(row => `<tr class="task-row ${state.selected === row.task_id ? "selected" : ""}" data-id="${esc(row.task_id)}"><td><div class="task-title">${esc(row.task.title || row.task.goal)}</div><div class="task-id">${esc(row.task_id)} · r${esc(row.state.revision)}</div></td><td><span class="executor">${esc(row.task.executor)}</span></td><td><span class="badge ${esc(row.state.status)}">${esc(labelStatus(row.state.status))}</span></td><td class="update-time">${esc(prettyTime(row.state.finished_at || row.state.started_at || row.state.created_at))}</td><td class="row-open">›</td></tr>`).join("");
   document.querySelectorAll(".task-row").forEach(el => el.addEventListener("click", () => selectTask(el.dataset.id)));
 }

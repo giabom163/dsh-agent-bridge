@@ -63,7 +63,7 @@
     var errorEl = document.getElementById(options.errorId || "graphError");
     var onSelect = typeof options.onSelect === "function" ? options.onSelect : null;
 
-    var state = { tasks: [], filter: "", selected: null, missing: [], connected: true, lastSuccessAt: null };
+    var state = { tasks: [], filter: "", selected: null, missing: [], connected: true, hasLoaded: false, lastSuccessAt: null };
 
     var controller = {
       available: false,
@@ -164,8 +164,16 @@
       if (!listEl) { return; }
       var rows = state.tasks.filter(matches);
       if (!rows.length) {
-        listEl.innerHTML = '<li class="graph-list-empty">' +
-          (state.tasks.length ? "没有匹配搜索的任务。" : "暂无任务。") + "</li>";
+        // 从未成功加载 ≠ 成功加载且确为空：文本列表也不把未知当成空。
+        var message;
+        if (!state.hasLoaded) {
+          message = "无法读取任务（尚未成功加载）；不能判定为空。";
+        } else if (state.tasks.length) {
+          message = "没有匹配搜索的任务。";
+        } else {
+          message = "暂无任务。";
+        }
+        listEl.innerHTML = '<li class="graph-list-empty">' + message + "</li>";
         return;
       }
       listEl.innerHTML = rows.map(function (row) {
@@ -199,8 +207,18 @@
     }
 
     function updateEmpty() {
-      if (emptyEl) { emptyEl.hidden = state.tasks.length !== 0; }
-      if (el) { el.classList.toggle("graph-canvas-empty", state.tasks.length === 0); }
+      // 只有“成功加载且确为空”才显示空态；从未成功加载时单独作为未知/不可读显示。
+      var empty = state.hasLoaded && state.tasks.length === 0;
+      if (emptyEl) { emptyEl.hidden = !empty; }
+      if (el) { el.classList.toggle("graph-canvas-empty", empty); }
+      if (errorEl) {
+        if (!state.hasLoaded && !controller.error) {
+          errorEl.hidden = false;
+          errorEl.textContent = "尚未成功读取任务列表；无法确认任务是否为空。请等待重试或检查本机连接。";
+        } else if (state.hasLoaded && !controller.error) {
+          errorEl.hidden = true;
+        }
+      }
     }
 
     function applyFilter() {
@@ -223,8 +241,9 @@
     }
 
     controller.available = true;
-    controller.update = function (tasks) {
+    controller.update = function (tasks, hasLoaded) {
       state.tasks = Array.isArray(tasks) ? tasks : [];
+      state.hasLoaded = hasLoaded === true;
       var built = buildElements(state.tasks);
       state.missing = built.missing;
       cy.elements().remove();
