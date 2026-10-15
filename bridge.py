@@ -325,19 +325,23 @@ def prompt_for(task, directory, attempt):
     """组装提示词。完整契约只内联一次，不回抄字段；工作区取真实 attempt.worktree。
 
     directory 是桥任务 store 目录（不是工作区），刻意不写进提示词；timeout 只来自契约字段，
-    包装文本不重复。
+    包装文本不重复。默认不测试，但明确写出契约授权的有限语法/定向检查可执行；并分行说明
+    allowed_paths/artifacts 语义、进度与验收独立、执行者不自动人工 accept，允许读源码或报缺证据。
     """
     worktree = attempt.get("worktree") or "(未记录)"
     base_commit = attempt.get("base_commit") or "(未记录)"
     return "\n".join([
-        "你是此任务的执行者。用简体中文交付。不要创建子代理，不要自动执行测试。",
+        "你是此任务的执行者。用简体中文交付。不要创建子代理。",
+        "默认不执行测试／服务／桌面；只有契约明确授权的有限语法或定向检查（如 node --check、内存 compile）可执行，不擅自扩大范围。",
         "只在当前工作区内修改契约允许的路径；不要提交、切分支或修改 .git、外部配置、供应商、桌面或服务。",
+        "allowed_paths 是可修改范围，artifacts 是必须交付的产物；产物须落在允许范围内，越界改动会被拒收。",
         "完整契约已内联一次（下列 JSON 是唯一契约来源，勿逐字复述其中字段）：",
         json.dumps(task, ensure_ascii=False),
         "task_id=" + task["task_id"] + " attempt_id=" + attempt["attempt_id"],
         "工作区（真实 attempt.worktree）：" + worktree,
         "基线 commit：" + base_commit,
-        "遇到不明确接口或缺少依据时，报告阻塞及所需证据，不猜测、不伪造通过。",
+        "进度（NOT_STARTED/READY/RUNNING/DONE/BLOCKED）与验收（PASS/FAIL/BLOCKED）是两套独立字段；执行者不得自动判定人工 accept。",
+        "允许阅读本工作区源码；遇到不明确接口或缺少依据时报告阻塞及所需证据，不猜测、不伪造通过。",
         "结束时说明实际修改、未执行的验证和阻塞；不要写入桥的状态文件。",
     ])
 

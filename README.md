@@ -62,11 +62,13 @@ doctor 只查看入口是否存在，不启动模型、服务或 UI。所有操�
 
 ### 契约字段与提示词/标签语义（B2）
 
+- 字段语义（`schemas/task.schema.json` 的 `description`，仅注解）：`allowed_paths` 是**可修改范围**（仓库相对路径或以 `/` 结尾的目录前缀），`artifacts` 是**必须交付的产物**且必须落在 `allowed_paths` 内；`input_refs` 是需固定 hash 的已跟踪输入文件；`completion_criteria` 供人工/只读审计核对，不替代机器证据。
 - 可选 `anchors`：`相对路径:行[,行|起-止]`（如 `web/task-graph.js:147,184,251-253`）。路径须是仓库相对路径，行号为正整数或正序区间；锚点文件必须同时列入 `input_refs` 以随输入固定 hash。越界行、反向区间、非正整数或未列入 `input_refs` 的锚点会被拒；旧契约没有该字段继续兼容。
-- 提示词把完整 task JSON 只内联一次，不再逐字复述 `goal`／`allowed_paths`／`completion_criteria`／`artifacts`；并内联真实 `attempt.worktree` 与基线 `base_commit`。提示词中的工作区是真实 attempt 工作区，不是桥任务 store 目录。
-- 协同图与文本列表标签优先显示短 `title`；无 `title` 时显示 `task_id` 的尾部并加省略标识（避免公共前缀难区分），完整 `task_id` 在文本列表经悬停提示（`title` 属性）可得、点击详情完整显示。
+- 提示词把完整 task JSON 只内联一次，不再逐字复述 `goal`／`allowed_paths`／`completion_criteria`／`artifacts`，也不复述时限或 anchors；并内联真实 `attempt.worktree` 与基线 `base_commit`。提示词中的工作区是真实 attempt 工作区，不是桥任务 store 目录。
+- 提示词**默认不执行测试/服务/桌面**，但契约明确授权的有限语法或定向检查（如 `node --check`、内存 `compile`）可执行，不擅自扩大；并分行说明 `allowed_paths`/`artifacts` 语义、进度（NOT_STARTED/READY/RUNNING/DONE/BLOCKED）与验收（PASS/FAIL/BLOCKED）是两套独立字段、执行者不得自动判定人工 accept，允许阅读工作区源码或在缺证据时报告阻塞。
+- 协同图节点标签优先显示短 `title`；无 `title` 时用 `task_id` 的尾部并加省略标识（避免公共前缀难区分）。文本列表**无 `title` 时直接显示完整 `task_id`**，并保留 `title` 属性；点击详情完整显示。
 
-`tests/prompt_checks.py --limit 3` 提供三组不调用模型、不联网的定向检查：prompt 单次内联与真实工作区/基线、anchors 与 artifacts 边界正反例，以及用本机 Node 实际执行标签逻辑核对缺 title 任务的尾部标签与完整 ID。只在用户手动执行时于 `data/` 内创建临时夹具与一次本地 Node 子进程，不启动服务、不自动清理现场。
+`tests/prompt_checks.py --limit 3` 提供三组不调用模型、不联网的定向检查：prompt 单次内联、真实工作区/基线与上述包装语义、anchors 与 artifacts 边界正反例，以及用本机 Node 实际执行标签逻辑核对缺 title 任务的图内尾部标签与文本列表完整 ID。只在用户手动执行时于 `data/` 内创建临时夹具与一次本地 Node 子进程，不启动服务、不自动清理现场。
 
 ```powershell
 & $bridgePython -B .\tests\prompt_checks.py --limit 3

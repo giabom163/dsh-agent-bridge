@@ -1,12 +1,16 @@
 """B2 提示词去重复、anchors 契约与缺 title 标签的三组定向离线检查（--limit 1–3）。
 
-组 1：prompt 单次内联契约 + 真实 attempt.worktree/base_commit + 旧契约兼容。
+组 1：prompt 单次内联契约 + 真实 attempt.worktree/base_commit + 旧契约兼容；
+      并断言包装行仍分行给出 allowed_paths/artifacts 语义、进度与验收独立、执行者不自动
+      人工 accept、允许读源码/报缺证据，且默认不测试但写明契约授权的有限检查可执行。
 组 2：anchors 合法/越界/反向/非正整数/未哈希输入，以及 artifacts 越界拒绝（含正例）。
 组 3：用本机已有 Node 实际执行 web/task-graph.js 的标签逻辑（无浏览器/联网），核对三条历史
-      缺 title 任务的尾部标签可区分且完整 task_id 在文本列表可得，不是纯字符串出现断言。
+      缺 title 任务：图内节点用尾部限长标签且互不相同，文本列表直接显示完整 task_id，
+      带 title 任务仍显示 title；完整 task_id 也在列表按钮 title 属性保留。不是纯字符串出现断言。
 
 --limit N 在执行前截断：只运行前 N 组（不是运行全部再裁输出）。只做本地文件读写与一次本地 Node
-子进程（无浏览器、无联网、无模型请求、不启动持久服务）。失败如实记录并保留报告；不自动重跑。
+子进程（无浏览器、无联网、无模型请求、不启动持久服务）。本修订明确授权 --limit 3 一次与纯语法
+检查（node --check、内存 compile）；禁止全量与持久服务。失败如实记录并保留报告；不自动重跑。
 """
 import argparse
 import copy
@@ -97,7 +101,13 @@ if (!graph || !graph.available) { console.error("graph unavailable"); process.ex
 graph.update(tasks, true);
 
 const nodeLabels = fakeCytoscape.last._nodes.map(function (n) { return { id: n.id(), label: n.data().label }; });
-console.log(JSON.stringify({ node_labels: nodeLabels, list_html: els.graphList.innerHTML, note_html: els.graphNote.innerHTML }));
+const listItems = [];
+const itemRe = /<button[^>]*\bdata-id="([^"]*)"[^>]*\btitle="([^"]*)"[^>]*>([\s\S]*?)<\/button>/g;
+let match;
+while ((match = itemRe.exec(els.graphList.innerHTML)) !== null) {
+  listItems.push({ id: match[1], title: match[2], text: match[3] });
+}
+console.log(JSON.stringify({ node_labels: nodeLabels, list_items: listItems, note_html: els.graphNote.innerHTML }));
 """
 
 
@@ -114,13 +124,16 @@ def make_repo(home, name, files):
 def expected_wrapper(task, attempt):
     """prompt_for 中除内联 JSON 外的固定包装行；用于结构化断言 goal 等字段不在 JSON 外重复。"""
     return [
-        "你是此任务的执行者。用简体中文交付。不要创建子代理，不要自动执行测试。",
+        "你是此任务的执行者。用简体中文交付。不要创建子代理。",
+        "默认不执行测试／服务／桌面；只有契约明确授权的有限语法或定向检查（如 node --check、内存 compile）可执行，不擅自扩大范围。",
         "只在当前工作区内修改契约允许的路径；不要提交、切分支或修改 .git、外部配置、供应商、桌面或服务。",
+        "allowed_paths 是可修改范围，artifacts 是必须交付的产物；产物须落在允许范围内，越界改动会被拒收。",
         "完整契约已内联一次（下列 JSON 是唯一契约来源，勿逐字复述其中字段）：",
         "task_id=" + task["task_id"] + " attempt_id=" + attempt["attempt_id"],
         "工作区（真实 attempt.worktree）：" + attempt["worktree"],
         "基线 commit：" + attempt["base_commit"],
-        "遇到不明确接口或缺少依据时，报告阻塞及所需证据，不猜测、不伪造通过。",
+        "进度（NOT_STARTED/READY/RUNNING/DONE/BLOCKED）与验收（PASS/FAIL/BLOCKED）是两套独立字段；执行者不得自动判定人工 accept。",
+        "允许阅读本工作区源码；遇到不明确接口或缺少依据时报告阻塞及所需证据，不猜测、不伪造通过。",
         "结束时说明实际修改、未执行的验证和阻塞；不要写入桥的状态文件。",
     ]
 
@@ -167,6 +180,10 @@ def check_prompt(home):
         "contract_json_once": len(json_lines) == 1,
         "contract_json_content_matches": bool(json_lines) and json.loads(json_lines[0]) == validated,
         "goal_not_repeated_outside_json": wrapper == expected,
+        "wrapper_states_allowed_artifacts_semantics": any("allowed_paths 是可修改范围，artifacts 是必须交付的产物" in line for line in wrapper),
+        "wrapper_separates_progress_and_acceptance": any("两套独立字段" in line and "自动判定人工 accept" in line for line in wrapper),
+        "wrapper_authorizes_only_limited_checks": any("契约明确授权的有限语法或定向检查" in line for line in wrapper),
+        "wrapper_allows_source_or_evidence": any("允许阅读本工作区源码" in line and "报告阻塞及所需证据" in line for line in wrapper),
         "workspace_from_attempt_worktree": ("工作区（真实 attempt.worktree）：" + str(worktree)) in wrapper,
         "store_dir_not_used_as_workspace": str(store) not in prompt,
         "base_commit_inline": ("基线 commit：" + attempt["base_commit"]) in prompt,
@@ -245,16 +262,23 @@ def check_node_labels(home):
                            "stderr": bridge.scrub(proc.stderr.decode("utf-8", "replace"))[-800:]}}
     data = json.loads(proc.stdout.decode("utf-8"))
     labels = {item["id"]: item["label"] for item in data["node_labels"]}
-    list_html = data["list_html"]
+    items = {item["id"]: item for item in data["list_items"]}
+
+    def list_text(tid):
+        return items.get(tid, {}).get("text")
+
     detail = {
-        "tails_match_real_node_labels": all(labels.get(tid) == expected_label(tid) for tid in HISTORICAL_TITLELESS_IDS),
-        "tails_pairwise_distinct": len({labels.get(tid) for tid in HISTORICAL_TITLELESS_IDS}) == 3,
-        "title_still_prioritized": labels.get("titled-fixture") == "B0 状态映射审查",
-        "full_task_id_in_list": all(('title="' + tid + '"') in list_html for tid in HISTORICAL_TITLELESS_IDS),
-        "tail_label_in_list": all(expected_label(tid) in list_html for tid in HISTORICAL_TITLELESS_IDS),
+        "graph_tail_matches_real_node_labels": all(labels.get(tid) == expected_label(tid) for tid in HISTORICAL_TITLELESS_IDS),
+        "graph_tails_pairwise_distinct": len({labels.get(tid) for tid in HISTORICAL_TITLELESS_IDS}) == 3,
+        "graph_title_still_prioritized": labels.get("titled-fixture") == "B0 状态映射审查",
+        "list_shows_full_task_id_when_titleless": all(list_text(tid) == tid for tid in HISTORICAL_TITLELESS_IDS),
+        "list_full_ids_pairwise_distinct": len({list_text(tid) for tid in HISTORICAL_TITLELESS_IDS}) == 3,
+        "list_title_still_prioritized": list_text("titled-fixture") == "B0 状态映射审查",
+        "list_keeps_full_id_title_attr": all(items.get(tid, {}).get("title") == tid for tid in HISTORICAL_TITLELESS_IDS),
         "node_labels": labels,
+        "list_items": items,
     }
-    ok = all(value for key, value in detail.items() if key != "node_labels")
+    ok = all(value for key, value in detail.items() if key not in ("node_labels", "list_items"))
     return {"check": "titleless_id_tail_and_full_list_node", "status": "PASS" if ok else "FAIL", "detail": detail}
 
 

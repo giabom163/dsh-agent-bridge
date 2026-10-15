@@ -3,9 +3,9 @@
  * 数据来源只有 web/app.js 已获取的 /api/tasks 列表（每条为当前尝试，不是完整历史）。
  * 本组件自身不发起任何网络请求，不请求 native-status，也不触发模型请求。
  * 节点是真实任务；边只来自 task.dependencies。有依赖边时用 Cytoscape 内置 breadthfirst，
- * 无依赖边时用内置 grid 多列铺开；不加载任何布局扩展。图内与文本列表标签只取短 title
- * （无 title 用 task_id 的尾部并加省略标识，避免公共前缀难区分；完整 id 经列表 title 属性可得、
- * 点击详情完整显示，绝不用整段 goal）。Cytoscape 缺失时明确报错，不做假图降级。
+ * 无依赖边时用内置 grid 多列铺开；不加载任何布局扩展。图内节点标签只取短 title（无 title 用
+ * task_id 的尾部并加省略标识，避免公共前缀难区分）；文本列表对无 title 的任务直接显示完整
+ * task_id，点击详情也完整显示，绝不用整段 goal。Cytoscape 缺失时明确报错，不做假图降级。
  */
 (function (global) {
   "use strict";
@@ -48,15 +48,20 @@
     return "未知（" + value + "）"; // 不默认 PASS
   }
   function modelLabel(value) { return blank(value) ? "未记录" : String(value); }
-  // 图内与文本列表共用的短标签：优先简短 title（限长），无 title 用 task_id。
-  // 长 task_id 取尾部并加省略标识，避免公共前缀把不同任务显示成同一标签；完整 id 在文本列表
-  // 经 title 属性可得、点击详情完整显示。绝不把整段 goal 当标签。
+  // 图内节点短标签：优先简短 title（限长），无 title 用 task_id 尾部并加省略标识，避免公共
+  // 前缀把不同任务显示成同一标签；完整 id 在文本列表直接显示、点击详情完整显示。绝不把整段 goal 当标签。
   var LABEL_MAX = 28;
   function taskLabel(task, id) {
     var title = blank(task && task.title) ? "" : String(task.title).trim();
     if (title) { return title.length > LABEL_MAX ? title.slice(0, LABEL_MAX - 1) + "…" : title; }
     var raw = String(id == null ? "" : id);
     return raw.length > LABEL_MAX ? "…" + raw.slice(-(LABEL_MAX - 1)) : raw;
+  }
+  // 文本列表标签：有 title 用 title；无 title 直接给出完整 task_id（不做尾部截断），使公共前缀
+  // 相近的任务在列表里也能分辨；图内节点仍用 taskLabel 的限长尾部。
+  function listLabel(task, id) {
+    var title = blank(task && task.title) ? "" : String(task.title).trim();
+    return title ? title : String(id == null ? "" : id);
   }
   function badgeClass(value) { return "badge " + safeClass(value); }
   function prettyTime(value) {
@@ -193,7 +198,7 @@
         var deps = Array.isArray(task.dependencies) ? task.dependencies : [];
         return '<li class="' + (state.selected === row.task_id ? "selected" : "") + '">' +
           '<button type="button" class="graph-list-item" data-id="' + esc(row.task_id) + '" title="' + esc(row.task_id) + '">' +
-          esc(taskLabel(task, row.task_id)) + "</button>" +
+          esc(listLabel(task, row.task_id)) + "</button>" +
           '<span class="' + badgeClass(s.status) + '">' + esc(statusLabel(s.status)) + "</span>" +
           '<span class="graph-list-accept">验收：' + esc(acceptanceLabel(s.acceptance)) + "</span>" +
           '<span class="graph-list-model">模型：' + esc(modelLabel(task.model)) + "</span>" +
