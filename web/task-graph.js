@@ -2,8 +2,9 @@
  *
  * 数据来源只有 web/app.js 已获取的 /api/tasks 列表（每条为当前尝试，不是完整历史）。
  * 本组件自身不发起任何网络请求，不请求 native-status，也不触发模型请求。
- * 节点是真实任务；边只来自 task.dependencies；使用 Cytoscape 内置 breadthfirst 布局，
- * 不加载任何布局扩展；Cytoscape 缺失时明确报错，不做假图降级。
+ * 节点是真实任务；边只来自 task.dependencies。有依赖边时用 Cytoscape 内置 breadthfirst，
+ * 无依赖边时用内置 grid 多列铺开；不加载任何布局扩展。图内与文本列表标签只取短 title
+ * （无 title 用 task_id，绝不用整段 goal）。Cytoscape 缺失时明确报错，不做假图降级。
  */
 (function (global) {
   "use strict";
@@ -46,6 +47,13 @@
     return "未知（" + value + "）"; // 不默认 PASS
   }
   function modelLabel(value) { return blank(value) ? "未记录" : String(value); }
+  // 图内与文本列表共用的短标签：优先简短 title，其次 task_id，绝不把整段 goal 当标签。
+  var LABEL_MAX = 28;
+  function taskLabel(task, id) {
+    var title = blank(task && task.title) ? "" : String(task.title).trim();
+    var text = title || String(id == null ? "" : id);
+    return text.length > LABEL_MAX ? text.slice(0, LABEL_MAX - 1) + "…" : text;
+  }
   function badgeClass(value) { return "badge " + safeClass(value); }
   function prettyTime(value) {
     if (!value) { return "尚未成功"; }
@@ -144,7 +152,7 @@
         var statusValue = blank(s.status) ? "" : String(s.status);
         nodes.push({ data: {
           id: id,
-          label: task.title || task.goal || id,
+          label: taskLabel(task, id),
           status: statusValue
         }, classes: "status-" + safeClass(blank(statusValue) ? "unknown" : statusValue) });
       });
@@ -181,7 +189,7 @@
         var deps = Array.isArray(task.dependencies) ? task.dependencies : [];
         return '<li class="' + (state.selected === row.task_id ? "selected" : "") + '">' +
           '<button type="button" class="graph-list-item" data-id="' + esc(row.task_id) + '">' +
-          esc(task.title || task.goal || row.task_id) + "</button>" +
+          esc(taskLabel(task, row.task_id)) + "</button>" +
           '<span class="' + badgeClass(s.status) + '">' + esc(statusLabel(s.status)) + "</span>" +
           '<span class="graph-list-accept">验收：' + esc(acceptanceLabel(s.acceptance)) + "</span>" +
           '<span class="graph-list-model">模型：' + esc(modelLabel(task.model)) + "</span>" +
@@ -240,6 +248,24 @@
       if (onSelect) { onSelect(taskId); }
     }
 
+    // 无依赖边时不做单排长列：用 Cytoscape core 内置 grid 多列铺开；
+    // 有真实依赖边时仍用 breadthfirst 保留真实层级关系。
+    function layoutOptions(nodeCount) {
+      if (cy.edges().length) {
+        return { name: "breadthfirst", directed: true, spacingFactor: 1.15, padding: 26,
+                 fit: true, animate: false, nodeDimensionsIncludeLabels: true };
+      }
+      var cols = Math.max(1, Math.ceil(Math.sqrt(Math.max(1, nodeCount))));
+      return { name: "grid", cols: cols, avoidOverlap: true, avoidOverlapPadding: 12,
+               padding: 26, fit: true, animate: false, nodeDimensionsIncludeLabels: true };
+    }
+
+    // 过滤后只按可见节点取景，避免仍被 filtered-out 的隐藏标签撑大边界而缩得极小。
+    function fitVisible() {
+      var visible = cy.elements().filter(function (ele) { return !ele.hasClass("filtered-out"); });
+      if (visible.length) { cy.fit(visible, 26); }
+    }
+
     controller.available = true;
     controller.update = function (tasks, hasLoaded) {
       state.tasks = Array.isArray(tasks) ? tasks : [];
@@ -248,9 +274,9 @@
       state.missing = built.missing;
       cy.elements().remove();
       cy.add(built.nodes.concat(built.edges));
-      cy.layout({ name: "breadthfirst", directed: true, spacingFactor: 1.15, padding: 26,
-                  fit: true, animate: false, nodeDimensionsIncludeLabels: true }).run();
+      cy.layout(layoutOptions(cy.nodes().length)).run();
       applyFilter();
+      fitVisible();
       renderList();
       renderNote();
       updateEmpty();
@@ -258,6 +284,7 @@
     controller.setFilter = function (query) {
       state.filter = String(query == null ? "" : query).trim().toLowerCase();
       applyFilter();
+      fitVisible();
       renderList();
     };
     controller.select = function (taskId) {

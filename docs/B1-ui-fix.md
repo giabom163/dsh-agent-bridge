@@ -1,16 +1,14 @@
 # B1 UI 修复说明
 
-## 根因
-`web/style.css` 中 `.graph-error,.graph-empty{display:grid}` 的类选择器特异性高于浏览器默认 `[hidden]{display:none}`，因此 JS 里 `hidden=true`（如空态）时元素 computed display 仍为 `grid`，绝对定位覆盖在画布上，遮挡十个任务按钮与三个 canvas。
+## 问题一：hidden 遮挡（已修）
+`.graph-error,.graph-empty{display:grid}` 压过 `[hidden]` 默认规则，设 hidden 后仍盖住画布；补 `.graph-empty[hidden],.graph-error[hidden]{display:none}`。
 
-## 改动
-`web/style.css` 仅新增一条作用域规则：
+## 问题二：图几乎成细线（改 task-graph.js）
+1. label 原用 goal（旧任务缺 title），fit 被撑到极小；现 taskLabel 优先 title，无 title 用 task_id，限 28 字符；列表同改，goal 仍留详情。
+2. 无依赖边原单排成行，现用内置 grid 多列；有边仍 breadthfirst。
+3. 过滤后 fitVisible() 按可见节点取景。
 
-```
-.graph-empty[hidden],.graph-error[hidden]{display:none}
-```
+未改依赖/API。
 
-使其 `hidden` 真正不显示；未触碰其他样式，未改 JS/API/内核/依赖/配置。
-
-## 未实机项
-本机未启动服务、未跑浏览器，修复未做真机验证。真机验收由主线程执行；本文档不给出最终 PASS。
+## 未验项
+未起服务与浏览器，未实机验证；交主线程复测，不给 PASS。
