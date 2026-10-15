@@ -1,0 +1,114 @@
+# Agent Bridge Demo
+
+本地命令行工具＋随项目交付的 Skill。Codex 写任务，DSH／OpenCode 在独立 worktree 实现；桥记录状态和产物。Python 标准库，无需安装依赖。代码已生成；真实模型、取消和用户路径验收均为 **BLOCKED**，没有自动执行测试。
+
+## 本机入口与边界
+
+- 默认采用本机已核对的托管 Node、全局 DSH CLI 和 OpenCode v2.0.20 CLI；可通过 `--config <json>` 覆盖 `node`、`dsh`、`opencode` 三个入口路径，配置由本运行器读取。
+- DSH 使用 `--profile headless --json -`，stdin 传入任务；模型选择来自原生配置，尚未执行验收。
+- OpenCode 使用 `run --standalone --format json --model provider/model`。采用私有实例是为了让取消限制在桥自己的进程树；不改变现有共享服务。
+- Windows 用 Job 对象登记自己的进程树。登记是在创建进程之后，早期子进程竞态和取消停稳尚未实测；POSIX 分支也未实测。
+- 单任务、墙钟超时、基线与输入哈希、过期结果拒收已实现；原生内部请求数量、重试和 20 秒节流未实证，不承诺硬额度限制。普通开发任务与最多两次探测的规则分开，不自动发探测。
+- worktree 不是权限沙箱；事后路径检查会拒收可观察的越界改动，但不能证明进程没碰外部路径。Git 忽略文件不纳入快照。不得用于不可信执行者。
+- 构建后的模拟/假执行仅作辅助检查；若无法验证目标行为，必须执行最小范围真实执行器验收。启动前须明确真实配置读取路径、执行器/模型、仓库和文件范围、产物、请求/额度不确定性及进程影响，并取得该范围的用户批准。429 后至少冷却 5 分钟且不自动重试。
+
+## 本地浏览器控制台
+
+可在本仓库目录启动无第三方依赖的本地控制台：
+
+```powershell
+& $bridgePython -B .\webui.py --limit 3
+```
+
+服务只绑定 `127.0.0.1:8765`，默认读取本目录 `data/`。在浏览器打开启动输出中的地址，可查看任务、提交/修订契约、生成计划、批准单个执行、请求取消、记录只读审查，以及附上两类证据后提交人工接收。计划和状态查询不会启动执行器；运行、取消、接收都需要在页面逐项确认。证据文件会复制到任务目录并保留。
+
+运行操作会创建 detached worktree 并启动 DSH 或 OpenCode；可能消耗模型额度。桥目前没有原生请求次数或费用硬限制。停止控制台会关闭桥持有的任务进程树。关闭页面不会停止后台任务；需在页面查看状态并明确请求取消。
+
+控制台还未经过真实浏览器路径验收；它不能替代 DSH/OpenCode 产品任务的独立审查与用户真实路径证据。不要把“接收”用于虚构或测试证据。
+
+## 用户手动入口
+
+在此项目目录打开 PowerShell：
+
+```powershell
+$bridgePython = 'C:\Users\Lenovo\.workbuddy\binaries\python\versions\3.13.12\python.exe'
+& $bridgePython -B .\bridge.py --limit 3 doctor
+```
+
+doctor 只查看入口是否存在，不启动模型、服务或 UI。所有操作要求 `--limit 1–3`；一次 run 只执行一个任务，不会批量派活。
+
+创建你自己的 `task.json`，将 repo 替换为真实、干净且已提交的 Git 仓库根目录：
+
+```json
+{
+  "task_id": "daily-source",
+  "goal": "给已有日报模板增加来源和时间窗口；保持现有样式",
+  "repo": "D:/your-real-project",
+  "executor": "opencode",
+  "model": "opencode-go/deepseek-v4-pro",
+  "allowed_paths": ["report.html"],
+  "artifacts": ["report.html"],
+  "input_refs": ["report.html"],
+  "completion_criteria": ["页面显示来源和时间窗口", "说明改动及未执行的验证"],
+  "timeout_seconds": 300
+}
+```
+
+上述模型是官方通道，与 CC Switch 的两个 Go 套餐分开。示例只说明格式，不代表你已有此仓库或模板。选 DSH 时把 executor 改为 dsh 并移除 model。输入必须是已跟踪的普通文件；忽略文件不会随 worktree 带入。不存在的输入、脏仓库、没有 HEAD 的仓库都会阻塞；桥不自行提交你的源码。
+
+```powershell
+& $bridgePython -B .\bridge.py --limit 3 submit .\task.json
+& $bridgePython -B .\bridge.py --limit 3 plan daily-source
+```
+
+plan 展示动作、作用范围和限制，并返回真实 plan_sha256。用户明确批准这次动作后，手动将下条命令的哈希替换为刚取得的值：
+
+```powershell
+& $bridgePython -B .\bridge.py --limit 3 run daily-source --plan-sha256 '<真实计划哈希>' --approve-start --ack-unmetered
+```
+
+这会新增 detached worktree，启动新的执行器及私有子进程，可能消耗额度，超时会结束桥自身任务进程树。两个标记是你对该具体动作及未实证的请求预算限制的确认；Agent 不能自动代填批准。运行器前台等待，可在另一个终端只读查看状态。
+
+```powershell
+& $bridgePython -B .\bridge.py --limit 3 status daily-source
+# 仅在你明确批准停止该任务进程树后，将 attempt_id 换成 status 中的当前值：
+& $bridgePython -B .\bridge.py --limit 3 cancel daily-source --attempt-id '<当前尝试编号>' --approve-cancel
+```
+
+cancel 写入请求，运行器处理后才能确认停止；若运行器崩溃或窗口被强制关闭，状态可能仍是 running。不要强行改状态或按进程名杀软件，先报告并只读核对 PID、任务记录和 worktree。取消、超时、失败均保留现场，不自动删目录。
+
+## 结果、修订和人工验收
+
+默认记录在 `data/tasks/<task-id>/`：契约版本、state.json、events.jsonl，以及 attempts 中的工作区、日志、result.json、前后哈希和 diff。新增未跟踪文件由哈希清单和实际文件展示；普通 Git diff 不包含它们。
+
+完成后是 awaiting_review，acceptance 仍为 BLOCKED。退出码非零、缺产物、可观察越界或采集错误会记录 FAIL。DSH 记录原生 sessionId；OpenCode JSON 事件格式尚未通过真实输出核对，不捏造 sessionId 或 usage。
+
+有修改意见，将原契约复制为有实际修改的新版本，保持 task_id，手动调用：
+
+```powershell
+& $bridgePython -B .\bridge.py --limit 3 revise daily-source .\task-revised.json
+& $bridgePython -B .\bridge.py --limit 3 plan daily-source
+```
+
+修订保留旧契约和尝试，新一轮使用新工作区。已接收或运行中的任务禁止修订。
+
+只读审计形成非空证据文件，用户通过真实客户端验证后提供自己的证据文件。人工接收：
+
+```powershell
+& $bridgePython -B .\bridge.py --limit 3 review daily-source --decision audit --audit-evidence .\audit.md
+& $bridgePython -B .\bridge.py --limit 3 review daily-source --decision accept --audit-evidence .\audit.md --user-evidence .\user-evidence.md
+```
+
+桥核对退出状态、结果哈希、工作区是否又变动、证据文件及哈希，然后保存人工接收决定；不会判断两个任意文件就足以证明真实验收。证据内容须由独立只读审计和用户确认。接收不自动合并、不提交、不删除 worktree。
+
+## 手动验证
+
+`tests/manual_checks.py` 提供三个不调用模型的检查：路径越界拒绝、假执行者真实文件修改和回收、被改写结果的拒收。只在用户手动执行时于 data 内创建测试仓库、worktree 和本脚本的短时 Python 子进程；不启动真实软件或服务，不自动清理现场。取消、过期结果等其余行为没有动态检查证据。
+
+```powershell
+& $bridgePython -B .\tests\manual_checks.py --limit 3
+```
+
+这些检查只是辅助，不能代替真实 DSH／OpenCode 客户端路径。真实任务、取消和用户验收仍需各自证据。配套 Skill 在 `skills/agent-bridge/SKILL.md`，未安装到全局；可先让 Codex 读取该文件使用。
+
+本机小范围检查记录：经用户明确授权，路径拒绝通过；另两项首次在 worktree 准备阶段报 `fatal: '$GIT_DIR' too big`。缩短夹具目录后，只复测文件回收和结果改写拒收，两项通过。支持 `--only file_roundtrip tampered_result_rejection` 选择复测范围，不自动扩大测试。现场位于 data，未清理；这不是原生模型链路的 PASS。
