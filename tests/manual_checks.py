@@ -21,7 +21,7 @@ def expect_rejected(action):
 
 
 def fixture(home, name):
-    case = home / ("r" if name == "roundtrip" else "t")
+    case = home / name
     repo = case / "repo"
     repo.mkdir(parents=True)
     subprocess.run(["git", "init", str(repo)], check=True, capture_output=True)
@@ -65,7 +65,7 @@ def roundtrip(home):
     assert result["exit_code"] == 0, result
     assert [x["path"] for x in result["changes"]] == ["report.txt"], result
     assert (repo / "report.txt").read_text(encoding="utf-8") == "before\n"
-    worktree = Path(state["result_file"]).parent / "workspace"
+    worktree = bridge.recorded_worktree(Path(state["result_file"]).parent)
     assert (worktree / "report.txt").read_text(encoding="utf-8") == "after\n"
 
 
@@ -83,18 +83,38 @@ def tamper(home):
     assert current["status"] == "awaiting_review"
 
 
+def long_worktree_path(home):
+    """夹具工作区刻意超过 git 长路径阈值；验证桥改放短根后仍能准备、执行与回收。"""
+    name = "longpath-" + "boundary-" * 4 + "check"
+    repo, store, state = fixture(home, name)
+    natural = store / "tasks" / name / "attempts" / state["current_attempt"] / "workspace"
+    assert len(str(natural)) >= bridge.WORKTREE_PATH_LIMIT, ("夹具路径不够长，未覆盖长路径分支", len(str(natural)))
+    assert state["status"] == "awaiting_review", state
+    result = bridge.read(state["result_file"])
+    assert result["exit_code"] == 0 and not result["native_errors"], result
+    attempt_dir = Path(state["result_file"]).parent
+    worktree = bridge.recorded_worktree(attempt_dir)
+    assert worktree != natural, ("未改放短根", str(worktree))
+    assert len(str(worktree)) < bridge.WORKTREE_PATH_LIMIT, (len(str(worktree)), str(worktree))
+    assert bridge.read(attempt_dir / "attempt.json")["worktree_relocated_from"] == str(natural)
+    assert (worktree / "report.txt").read_text(encoding="utf-8") == "after\n"
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--limit", type=int, required=True)
-    parser.add_argument("--only", nargs="+", choices=("path_rejection", "file_roundtrip", "tampered_result_rejection"))
+    parser.add_argument("--only", nargs="+", choices=("path_rejection", "file_roundtrip",
+                                                      "tampered_result_rejection", "long_worktree_path"))
     args = parser.parse_args()
     if not 1 <= args.limit <= 3:
         parser.error("--limit 必须为 1–3，首次使用 --limit 3")
-    # 保留现场，但缩短 Windows Git worktree 的夹具路径。
+    # 保留现场；长路径不再靠缩短夹具规避，改由桥的短根回退处理（见 long_worktree_path）。
     home = ROOT / "data" / ("mc-" + uuid.uuid4().hex[:12])
     home.mkdir(parents=True)
     records = []
-    checks = [("path_rejection", paths), ("file_roundtrip", roundtrip), ("tampered_result_rejection", tamper)]
+    # 共 4 项；--limit 上限为 3，长路径回归须显式 --only long_worktree_path。
+    checks = [("path_rejection", paths), ("file_roundtrip", roundtrip), ("tampered_result_rejection", tamper),
+              ("long_worktree_path", long_worktree_path)]
     if args.only:
         checks = [(name, check) for name, check in checks if name in args.only]
     for name, check in checks[:args.limit]:

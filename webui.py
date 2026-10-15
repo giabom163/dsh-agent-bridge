@@ -3,15 +3,24 @@ import argparse
 import base64
 import json
 import re
+import sys
 import threading
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
+ROOT = Path(__file__).resolve().parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+# 部署目录里 bridge 只存在于 agent-bridge.pyz 内；Python 可直接从 zip 导入。
+ARCHIVE = ROOT / "agent-bridge.pyz"
+if ARCHIVE.is_file() and str(ARCHIVE) not in sys.path:
+    sys.path.insert(0, str(ARCHIVE))
+
 import bridge
 
-ROOT = Path(__file__).resolve().parent
 WEB_ROOT = ROOT / "web"
 MAX_BODY = 1024 * 1024
 

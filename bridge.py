@@ -20,6 +20,14 @@ import adapters
 ROOT = Path(__file__).resolve().parent
 ID = re.compile(r"[a-z0-9][a-z0-9-]{0,63}\Z")
 SECRET = re.compile(r"\b(?:oc_sk_|sk-|st_|rt_)[A-Za-z0-9_.-]{12,}|\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")
+# 本机实测（git 2.55.0.windows.2，LongPathsEnabled=1）：worktree 绝对路径 ≥216 字符时
+# git worktree add 必然报 "fatal: '$GIT_DIR' too big"（退出码 128），且 -c core.longpaths=true
+# 无效；仓库自身路径长短不影响该阈值。留出余量，超安全阈值就改放短根，超硬上限直接给桥自己的错误。
+WORKTREE_PATH_SAFE = 200
+WORKTREE_PATH_LIMIT = 215
+# 父会话若导出这些变量，git 会指向错误仓库或同样报错；调用 git 前统一剥离。
+GIT_ENV_STRIP = frozenset(("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+                           "GIT_COMMON_DIR", "GIT_ALTERNATE_OBJECT_DIRECTORIES"))
 
 
 def now():
@@ -55,10 +63,39 @@ def scrub(text):
 
 
 def git(repo, *args):
-    p = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, timeout=60)
+    env = {key: value for key, value in os.environ.items() if key.upper() not in GIT_ENV_STRIP}
+    p = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, timeout=60, env=env)
     if p.returncode:
         raise ValueError("git " + args[0] + " 失败：" + scrub(p.stderr.decode("utf-8", "replace")))
     return p.stdout
+
+
+def default_worktree_root():
+    base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+    return Path(base) / "agent-bridge" / "wt"
+
+
+def worktree_path(attempt_dir, attempt_id, config):
+    """返回 (工作区路径, 是否已改放短根)。过长路径会让 git 直接失败，必须先判定。"""
+    natural = attempt_dir / "workspace"
+    if len(str(natural)) < WORKTREE_PATH_SAFE:
+        return natural, False
+    root = config.get("worktree_fallback_root") or default_worktree_root()
+    fallback = Path(root) / attempt_id.replace("attempt-", "a")
+    if len(str(fallback)) >= WORKTREE_PATH_LIMIT:
+        raise ValueError("工作区路径过长且短根仍超限（%d ≥ %d）；先缩短桥的 data 目录：%s"
+                         % (len(str(fallback)), WORKTREE_PATH_LIMIT, fallback))
+    return fallback, True
+
+
+def recorded_worktree(attempt_dir):
+    """读取 attempt.json 记录的真实工作区；早期现场没有该字段时回退到默认位置。"""
+    path = Path(attempt_dir) / "attempt.json"
+    if path.is_file():
+        value = read(path).get("worktree")
+        if isinstance(value, str) and value:
+            return Path(value)
+    return Path(attempt_dir) / "workspace"
 
 
 def inside(base, relative):
@@ -266,10 +303,16 @@ def run(store, task_id, config, expected, approve, acknowledge):
         attempt_id = "attempt-" + uuid.uuid4().hex
         attempt_dir = directory / "attempts" / attempt_id
         attempt_dir.mkdir(parents=True)
-        worktree = attempt_dir / "workspace"
-        attempt = {**approved, "attempt_id": attempt_id, "worktree": str(worktree), "started_at": now()}
-        atomic(attempt_dir / "attempt.json", attempt)
         try:
+            worktree, relocated = worktree_path(attempt_dir, attempt_id, config)
+            attempt = {**approved, "attempt_id": attempt_id, "worktree": str(worktree), "started_at": now()}
+            if relocated:
+                attempt["worktree_relocated_from"] = str(attempt_dir / "workspace")
+            atomic(attempt_dir / "attempt.json", attempt)
+            if relocated:
+                event(directory, "worktree_relocated", attempt_id=attempt_id, worktree=str(worktree),
+                      reason="路径过长时 git 报 '$GIT_DIR' too big；已按安全阈值改放短根")
+            worktree.parent.mkdir(parents=True, exist_ok=True)
             git(Path(task["repo"]), "worktree", "add", "--detach", str(worktree), approved["base_commit"])
             git_marker = digest((worktree / ".git").read_bytes())
             before = snapshot(worktree)
@@ -481,7 +524,7 @@ def review(store, task_id, decision, audit, user):
                 raise ValueError("机器证据不满足，拒绝接收")
             if set(evidence) != {"audit", "user"}:
                 raise ValueError("接收必须同时附只读审计和用户真实路径证据")
-            worktree = directory / "attempts" / state["current_attempt"] / "workspace"
+            worktree = recorded_worktree(directory / "attempts" / state["current_attempt"])
             if digest((worktree / ".git").read_bytes()) != result["git_marker_sha256"]:
                 raise ValueError("审查期间 .git 指针发生变化，拒绝接收")
             if git(worktree, "rev-parse", "HEAD").decode().strip() != result["base_commit"]:
