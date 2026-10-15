@@ -60,6 +60,18 @@ doctor 只查看入口是否存在，不启动模型、服务或 UI。所有操�
 
 上述模型沿用已连接的 OpenCode V2 Console 工作区；桥不配置 CC Switch 或重建 key。示例只说明格式，不代表你已有此仓库或模板。选 DSH 时把 executor 改为 dsh 并移除 model。输入必须是已跟踪的普通文件；忽略文件不会随 worktree 带入。不存在的输入、脏仓库、没有 HEAD 的仓库都会阻塞；桥不自行提交你的源码。
 
+### 契约字段与提示词/标签语义（B2）
+
+- 可选 `anchors`：`相对路径:行[,行|起-止]`（如 `web/task-graph.js:147,184,251-253`）。路径须是仓库相对路径，行号为正整数或正序区间；锚点文件必须同时列入 `input_refs` 以随输入固定 hash。越界行、反向区间、非正整数或未列入 `input_refs` 的锚点会被拒；旧契约没有该字段继续兼容。
+- 提示词把完整 task JSON 只内联一次，不再逐字复述 `goal`／`allowed_paths`／`completion_criteria`／`artifacts`；并内联真实 `attempt.worktree` 与基线 `base_commit`。提示词中的工作区是真实 attempt 工作区，不是桥任务 store 目录。
+- 协同图与文本列表标签优先显示短 `title`；无 `title` 时显示 `task_id` 的尾部并加省略标识（避免公共前缀难区分），完整 `task_id` 在文本列表经悬停提示（`title` 属性）可得、点击详情完整显示。
+
+`tests/prompt_checks.py --limit 3` 提供三组不调用模型、不联网的定向检查：prompt 单次内联与真实工作区/基线、anchors 与 artifacts 边界正反例，以及用本机 Node 实际执行标签逻辑核对缺 title 任务的尾部标签与完整 ID。只在用户手动执行时于 `data/` 内创建临时夹具与一次本地 Node 子进程，不启动服务、不自动清理现场。
+
+```powershell
+& $bridgePython -B .\tests\prompt_checks.py --limit 3
+```
+
 ```powershell
 & $bridgePython -B .\bridge.py --limit 3 submit .\task.json
 & $bridgePython -B .\bridge.py --limit 3 plan daily-source

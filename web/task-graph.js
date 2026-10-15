@@ -4,7 +4,8 @@
  * 本组件自身不发起任何网络请求，不请求 native-status，也不触发模型请求。
  * 节点是真实任务；边只来自 task.dependencies。有依赖边时用 Cytoscape 内置 breadthfirst，
  * 无依赖边时用内置 grid 多列铺开；不加载任何布局扩展。图内与文本列表标签只取短 title
- * （无 title 用 task_id，绝不用整段 goal）。Cytoscape 缺失时明确报错，不做假图降级。
+ * （无 title 用 task_id 的尾部并加省略标识，避免公共前缀难区分；完整 id 经列表 title 属性可得、
+ * 点击详情完整显示，绝不用整段 goal）。Cytoscape 缺失时明确报错，不做假图降级。
  */
 (function (global) {
   "use strict";
@@ -47,12 +48,15 @@
     return "未知（" + value + "）"; // 不默认 PASS
   }
   function modelLabel(value) { return blank(value) ? "未记录" : String(value); }
-  // 图内与文本列表共用的短标签：优先简短 title，其次 task_id，绝不把整段 goal 当标签。
+  // 图内与文本列表共用的短标签：优先简短 title（限长），无 title 用 task_id。
+  // 长 task_id 取尾部并加省略标识，避免公共前缀把不同任务显示成同一标签；完整 id 在文本列表
+  // 经 title 属性可得、点击详情完整显示。绝不把整段 goal 当标签。
   var LABEL_MAX = 28;
   function taskLabel(task, id) {
     var title = blank(task && task.title) ? "" : String(task.title).trim();
-    var text = title || String(id == null ? "" : id);
-    return text.length > LABEL_MAX ? text.slice(0, LABEL_MAX - 1) + "…" : text;
+    if (title) { return title.length > LABEL_MAX ? title.slice(0, LABEL_MAX - 1) + "…" : title; }
+    var raw = String(id == null ? "" : id);
+    return raw.length > LABEL_MAX ? "…" + raw.slice(-(LABEL_MAX - 1)) : raw;
   }
   function badgeClass(value) { return "badge " + safeClass(value); }
   function prettyTime(value) {
@@ -188,7 +192,7 @@
         var task = row.task || {}, s = row.state || {};
         var deps = Array.isArray(task.dependencies) ? task.dependencies : [];
         return '<li class="' + (state.selected === row.task_id ? "selected" : "") + '">' +
-          '<button type="button" class="graph-list-item" data-id="' + esc(row.task_id) + '">' +
+          '<button type="button" class="graph-list-item" data-id="' + esc(row.task_id) + '" title="' + esc(row.task_id) + '">' +
           esc(taskLabel(task, row.task_id)) + "</button>" +
           '<span class="' + badgeClass(s.status) + '">' + esc(statusLabel(s.status)) + "</span>" +
           '<span class="graph-list-accept">验收：' + esc(acceptanceLabel(s.acceptance)) + "</span>" +
@@ -208,8 +212,11 @@
         parts.push("<span>缺失依赖：" + state.missing.map(function (m) {
           return esc(m.dep) + "（被 " + esc(m.owner) + " 引用，但不在返回列表中；不伪造其节点或状态）";
         }).join("；") + "</span>");
-      } else if (state.tasks.length) {
+      } else if (cy.edges().length) {
         parts.push("<span>依赖边均来自 task.dependencies。</span>");
+      } else if (state.tasks.length) {
+        // 无任何解析边时明确说明，不暗示边已存在或已实机覆盖。
+        parts.push("<span>暂无依赖记录（依赖边仅来自 task.dependencies）。</span>");
       }
       noteEl.innerHTML = parts.join("");
     }

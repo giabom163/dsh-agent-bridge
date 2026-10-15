@@ -20,6 +20,8 @@ import adapters
 ROOT = Path(__file__).resolve().parent
 ID = re.compile(r"[a-z0-9][a-z0-9-]{0,63}\Z")
 SECRET = re.compile(r"\b(?:oc_sk_|sk-|st_|rt_)[A-Za-z0-9_.-]{12,}|\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")
+# 锚点：仓库相对路径:行或起-止（逗号分隔），如 web/task-graph.js:147,184,251-253。
+ANCHOR = re.compile(r"(?P<path>[^:]+):(?P<lines>\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*)")
 # 本机实测（git 2.55.0.windows.2，LongPathsEnabled=1）：worktree 绝对路径 ≥216 字符时
 # git worktree add 必然报 "fatal: '$GIT_DIR' too big"（退出码 128），且 -c core.longpaths=true
 # 无效；仓库自身路径长短不影响该阈值。留出余量，超安全阈值就改放短根，超硬上限直接给桥自己的错误。
@@ -143,6 +145,21 @@ def validate(task):
         inside(repo, item)
     if any(not allowed(x, task["allowed_paths"]) for x in task["artifacts"]):
         raise ValueError("产物必须落在允许修改的路径内")
+    # anchors 可选：旧契约没有该字段时继续兼容。
+    anchors = task.get("anchors", [])
+    if not isinstance(anchors, list) or any(not isinstance(x, str) or not x.strip() for x in anchors):
+        raise ValueError("anchors 必须是字符串数组")
+    for anchor in anchors:
+        path, spans = parse_anchor(anchor)
+        if path not in refs:
+            raise ValueError("锚点文件必须列入 input_refs 以固定 hash：" + path)
+        target = inside(repo, path)
+        if not target.is_file():
+            raise ValueError("锚点文件不存在：" + path)
+        total = len(target.read_text(encoding="utf-8").splitlines())
+        for start, end in spans:
+            if end > total:
+                raise ValueError("锚点行号越界：%s 第 %d 行超出文件 %d 行" % (path, end, total))
     timeout = task.get("timeout_seconds", 300)
     if type(timeout) is not int or not 10 <= timeout <= 3600:
         raise ValueError("timeout_seconds 应为 10–3600 秒整数")
@@ -157,6 +174,26 @@ def validate(task):
 
 def allowed(path, paths):
     return any(path == p or (p.endswith("/") and path.startswith(p)) for p in paths)
+
+
+def parse_anchor(anchor):
+    """解析 anchors 项：仓库相对路径:行或区间（逗号分隔）。拒绝格式、反向区间与非正整数。"""
+    match = ANCHOR.fullmatch(anchor)
+    if not match:
+        raise ValueError("锚点格式应为 相对路径:行[,行|起-止]：" + anchor)
+    spans = []
+    for chunk in match.group("lines").split(","):
+        if "-" in chunk:
+            left, right = chunk.split("-", 1)
+            start, end = int(left), int(right)
+            if start > end:
+                raise ValueError("锚点区间反向（起 > 止）：" + anchor)
+        else:
+            start = end = int(chunk)
+        if start < 1:
+            raise ValueError("锚点行号必须为正整数：" + anchor)
+        spans.append((start, end))
+    return match.group("path"), spans
 
 
 @contextmanager
@@ -285,15 +322,21 @@ def snapshot(repo):
 
 
 def prompt_for(task, directory, attempt):
+    """组装提示词。完整契约只内联一次，不回抄字段；工作区取真实 attempt.worktree。
+
+    directory 是桥任务 store 目录（不是工作区），刻意不写进提示词；timeout 只来自契约字段，
+    包装文本不重复。
+    """
+    worktree = attempt.get("worktree") or "(未记录)"
+    base_commit = attempt.get("base_commit") or "(未记录)"
     return "\n".join([
         "你是此任务的执行者。用简体中文交付。不要创建子代理，不要自动执行测试。",
         "只在当前工作区内修改契约允许的路径；不要提交、切分支或修改 .git、外部配置、供应商、桌面或服务。",
-        "完整契约已内联，无需读取工作区外文件：" + json.dumps(task, ensure_ascii=False),
+        "完整契约已内联一次（下列 JSON 是唯一契约来源，勿逐字复述其中字段）：",
+        json.dumps(task, ensure_ascii=False),
         "task_id=" + task["task_id"] + " attempt_id=" + attempt["attempt_id"],
-        "目标：" + task["goal"],
-        "允许修改：" + json.dumps(task["allowed_paths"], ensure_ascii=False),
-        "验收标准：" + json.dumps(task["completion_criteria"], ensure_ascii=False),
-        "交付文件：" + json.dumps(task["artifacts"], ensure_ascii=False),
+        "工作区（真实 attempt.worktree）：" + worktree,
+        "基线 commit：" + base_commit,
         "遇到不明确接口或缺少依据时，报告阻塞及所需证据，不猜测、不伪造通过。",
         "结束时说明实际修改、未执行的验证和阻塞；不要写入桥的状态文件。",
     ])
