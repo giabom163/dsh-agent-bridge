@@ -6,7 +6,7 @@
 
 - 默认采用本机已核对的托管 Node、全局 DSH CLI 和 OpenCode v2.0.20 CLI；可通过 `--config <json>` 覆盖 `node`、`dsh`、`opencode` 三个入口路径，配置由本运行器读取。
 - DSH 使用 `--profile headless --json -`，stdin 传入任务；模型选择来自原生配置，尚未执行验收。
-- OpenCode 使用 `run --standalone --format json --model provider/model`。采用私有实例是为了让取消限制在桥自己的进程树；不改变现有共享服务。
+- OpenCode 新前端默认 `opencode_mode: "shared"`：先创建本机后台服务空会话，再用 `run --session <原生ID> --format json --model provider/model`（每次先核对后台服务地址，复用 CLI 自管认证） 发送提示词。固定使用现有 V2 Console 工作区连接，不改凭据。旧契约缺省仍为 `standalone`，明确选择时继续支持私有实例。
 - Windows 用 Job 对象登记自己的进程树。登记是在创建进程之后，早期子进程竞态和取消停稳尚未实测；POSIX 分支也未实测。
 - 单任务、墙钟超时、基线与输入哈希、过期结果拒收已实现；原生内部请求数量、重试和 20 秒节流未实证，不承诺硬额度限制。普通开发任务与最多两次探测的规则分开，不自动发探测。
 - worktree 不是权限沙箱；事后路径检查会拒收可观察的越界改动，但不能证明进程没碰外部路径。Git 忽略文件不纳入快照。不得用于不可信执行者。
@@ -24,9 +24,9 @@
 
 服务只绑定 `127.0.0.1:8765`，默认读取本目录 `data/`。在浏览器打开启动输出中的地址，可查看任务、提交/修订契约、生成计划、批准单个执行、请求取消、记录只读审查，以及附上两类证据后提交人工接收。计划和状态查询不会启动执行器；运行、取消、接收都需要在页面逐项确认。证据文件会复制到任务目录并保留。
 
-运行操作会创建 detached worktree 并启动 DSH 或 OpenCode；可能消耗模型额度。桥目前没有原生请求次数或费用硬限制。停止控制台会关闭桥持有的任务进程树。关闭页面不会停止后台任务；需在页面查看状态并明确请求取消。
+运行操作会创建 detached worktree 并启动 DSH 或 OpenCode；可能消耗模型额度。桥目前没有原生请求次数或费用硬限制。共享模式停止控制台可能中断观察，但不会停止 OpenCode 后台服务，也不能据此宣称任务已停。关闭页面不会停止后台任务；需在页面请求取消并核对原生停稳记录。若控制台意外退出，可重开同一 store，点击“回读原生状态”；不会重复发送提示词，也不会自动补造文件回收结果。
 
-控制台还未经过真实浏览器路径验收；它不能替代 DSH/OpenCode 产品任务的独立审查与用户真实路径证据。不要把“接收”用于虚构或测试证据。
+旧控制台已有真实浏览器记录；本次共享会话改版仍待真实客户端验收，不能沿用旧版记录当作通过。它不能替代独立审查与用户真实路径证据。不要把“接收”用于虚构或测试证据。
 
 ## 用户手动入口
 
@@ -44,10 +44,12 @@ doctor 只查看入口是否存在，不启动模型、服务或 UI。所有操�
 ```json
 {
   "task_id": "daily-source",
+  "title": "日报模板来源与时间窗口",
+  "opencode_mode": "shared",
   "goal": "给已有日报模板增加来源和时间窗口；保持现有样式",
   "repo": "D:/your-real-project",
   "executor": "opencode",
-  "model": "opencode-go/deepseek-v4-pro",
+  "model": "opencode-go/deepseek-v4.1-flash",
   "allowed_paths": ["report.html"],
   "artifacts": ["report.html"],
   "input_refs": ["report.html"],
@@ -56,7 +58,7 @@ doctor 只查看入口是否存在，不启动模型、服务或 UI。所有操�
 }
 ```
 
-上述模型是官方通道，与 CC Switch 的两个 Go 套餐分开。示例只说明格式，不代表你已有此仓库或模板。选 DSH 时把 executor 改为 dsh 并移除 model。输入必须是已跟踪的普通文件；忽略文件不会随 worktree 带入。不存在的输入、脏仓库、没有 HEAD 的仓库都会阻塞；桥不自行提交你的源码。
+上述模型沿用已连接的 OpenCode V2 Console 工作区；桥不配置 CC Switch 或重建 key。示例只说明格式，不代表你已有此仓库或模板。选 DSH 时把 executor 改为 dsh 并移除 model。输入必须是已跟踪的普通文件；忽略文件不会随 worktree 带入。不存在的输入、脏仓库、没有 HEAD 的仓库都会阻塞；桥不自行提交你的源码。
 
 ```powershell
 & $bridgePython -B .\bridge.py --limit 3 submit .\task.json
@@ -66,10 +68,12 @@ doctor 只查看入口是否存在，不启动模型、服务或 UI。所有操�
 plan 展示动作、作用范围和限制，并返回真实 plan_sha256。用户明确批准这次动作后，手动将下条命令的哈希替换为刚取得的值：
 
 ```powershell
-& $bridgePython -B .\bridge.py --limit 3 run daily-source --plan-sha256 '<真实计划哈希>' --approve-start --ack-unmetered
+& $bridgePython -B .\bridge.py --limit 3 prepare daily-source --plan-sha256 '<真实计划哈希>' --approve-start --ack-unmetered
+# 在原生客户端找到同一服务、工作区和会话后，再执行：
+& $bridgePython -B .\bridge.py --limit 3 run daily-source --plan-sha256 '<同一真实计划哈希>' --approve-start --ack-unmetered --confirm-visible
 ```
 
-这会新增 detached worktree，启动新的执行器及私有子进程，可能消耗额度，超时会结束桥自身任务进程树。两个标记是你对该具体动作及未实证的请求预算限制的确认；Agent 不能自动代填批准。运行器前台等待，可在另一个终端只读查看状态。
+prepare 新增 detached worktree 和有标题的原生空会话，不发送模型提示词；run 才可能消耗额度。前端显示 ID、服务和实际目录；不能把 API 回读成功当作客户端可见。共享模式取消/超时先发 session.interrupt，只结束本次 CLI 观察进程，不关闭共享服务。原生 idle 时间未确认时状态为 stop_unconfirmed/BLOCKED，禁止重派、修订和接收。两个标记是你对该具体动作及未实证的请求预算限制的确认；Agent 不能自动代填批准。运行器前台等待，可在另一个终端只读查看状态。
 
 ```powershell
 & $bridgePython -B .\bridge.py --limit 3 status daily-source
@@ -83,7 +87,7 @@ cancel 写入请求，运行器处理后才能确认停止；若运行器崩溃�
 
 默认记录在 `data/tasks/<task-id>/`：契约版本、state.json、events.jsonl，以及 attempts 中的工作区、日志、result.json、前后哈希和 diff。工作区默认是 `attempts/<attempt-id>/workspace`；只有该绝对路径 ≥200 字符时才改放短根，`review` 与离线检查一律按 `attempt.json` 记录的真实路径核对，不按固定相对路径猜。新增未跟踪文件由哈希清单和实际文件展示；普通 Git diff 不包含它们。
 
-完成后是 awaiting_review，acceptance 仍为 BLOCKED。退出码非零、缺产物、可观察越界或采集错误会记录 FAIL。DSH 记录原生 sessionId；OpenCode JSON 事件格式尚未通过真实输出核对，不捏造 sessionId 或 usage。
+完成后是 awaiting_review，acceptance 仍为 BLOCKED。退出码非零、缺产物、可观察越界或采集错误会记录 FAIL。DSH 记录原生 sessionId；OpenCode 采集 sessionID 和工具 error 警告。共享会话元数据保存在 native-session.json，发送意图保存在 prompt-intent.json：即使发送失败或中途崩溃也不自动重发。只从原生 session.get 回读 tokens，不估计请求数或费用。任务提示词完整内联契约，不要求读取 worktree 外文件。
 
 有修改意见，将原契约复制为有实际修改的新版本，保持 task_id，手动调用：
 
@@ -92,7 +96,7 @@ cancel 写入请求，运行器处理后才能确认停止；若运行器崩溃�
 & $bridgePython -B .\bridge.py --limit 3 plan daily-source
 ```
 
-修订保留旧契约和尝试，新一轮使用新工作区。已接收或运行中的任务禁止修订。
+修订保留旧契约和尝试，新一轮使用新工作区。已接收、运行中、已准备的空会话及原生停止未确认任务禁止修订；保留原始会话和现场，不自动清理。
 
 只读审计形成非空证据文件，用户通过真实客户端验证后提供自己的证据文件。人工接收：
 
@@ -114,3 +118,13 @@ cancel 写入请求，运行器处理后才能确认停止；若运行器崩溃�
 这些检查只是辅助，不能代替真实 DSH／OpenCode 客户端路径。真实任务、取消和用户验收仍需各自证据。配套 Skill 在 `skills/agent-bridge/SKILL.md`，未安装到全局；可先让 Codex 读取该文件使用。
 
 本机小范围检查记录：经用户明确授权，路径拒绝通过；另两项首次在 worktree 准备阶段报 `fatal: '$GIT_DIR' too big`。缩短夹具目录后，只复测文件回收和结果改写拒收，两项通过。**该绕法已由桥的短根回退取代**：`long_worktree_path` 用刻意超过 216 字符的夹具验证回退后仍能准备、执行与回收（本机通过）。支持 `--only file_roundtrip tampered_result_rejection long_worktree_path` 选择复测范围，不自动扩大测试。现场位于 data，未清理；这不是原生模型链路的 PASS。
+
+## 共享会话改版的验收边界
+
+- `/api/runtime` 固定记录启动时真正加载的 bridge/adapters/控制台/静态文件哈希、PID、store；文件后来变了不会冒充已加载新版本。浏览器页脚显示摘要。
+- 新任务须明确 `title`、`opencode_mode: "shared"` 和已核实模型。先生成计划、创建空会话，在真实 OpenCode 客户端定位后勾选可见，再发送提示词。没有客户端证据则 BLOCKED。
+- 桥通过本机 CLI 完成服务认证，不记录配对口令。只允许无凭据的 `http://127.0.0.1:<实际端口>`，不开放远程服务、改 CORS 或安全配置。
+- 保留 DSH 长路径回退与 Git 环境修复。本次没有自动运行测试或新模型任务；语法构建检查不等于实机验收。
+- 控制台意外退出后，仍可读取既有会话和日志。缺结果的孤立执行需要审查与补采，不自动改状态、重发或伪造成功。
+
+本机 2.0.20 显式 `--server` 只读核验失败：`requires a password; set OPENCODE_PASSWORD`。桥因此使用已认证的默认后台连接，操作前核对 `service status`；不复制服务密码、不修改安全设置。

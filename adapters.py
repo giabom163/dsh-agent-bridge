@@ -2,6 +2,9 @@
 import os
 from pathlib import Path
 import re
+import json
+import subprocess
+from urllib.parse import urlsplit
 
 NODE = Path(r"C:\Users\Lenovo\.workbuddy\binaries\node\versions\22.22.2-3\node.exe")
 DSH = Path(r"C:\Users\Lenovo\AppData\Roaming\npm\node_modules\@deepseek-ai\dsh\lib\bin.js")
@@ -25,7 +28,16 @@ def build(task, prompt, config):
         model = task.get("model")
         if not isinstance(model, str) or not re.fullmatch(r"[\w.-]+/[\w.#+-]+", model):
             raise ValueError("OpenCode 必须明确指定 provider/model；不使用不明默认值")
-        args = [str(entry), "run", "--standalone", "--format", "json", "--model", model]
+        args = [str(entry), "run", "--format", "json", "--model", model]
+        if shared(task):
+            native = config.get("native_session")
+            if native:
+                local_server(native["server"])
+                args += ["--session", native["session_id"]]
+            # plan 只构造命令；真正运行必须先创建并记录原生会话。
+            args += ["--title", task.get("title", task["task_id"])]
+        else:
+            args += ["--standalone"]
         agent = task.get("agent")
         if agent:
             if not re.fullmatch(r"[\w.-]+", agent):
@@ -33,6 +45,48 @@ def build(task, prompt, config):
             args += ["--agent", agent]
         return args + [prompt], None
     raise ValueError("只支持 dsh / opencode 执行器")
+
+
+def shared(task):
+    return task["executor"] == "opencode" and task.get("opencode_mode", "standalone") == "shared"
+
+
+def local_server(value):
+    p = urlsplit(value)
+    if (p.scheme != "http" or p.hostname != "127.0.0.1" or not p.port or p.username
+            or p.password or p.path not in ("", "/") or p.query or p.fragment):
+        raise ValueError("共享服务必须是无凭据的本机 127.0.0.1 HTTP 地址")
+    return value.rstrip("/")
+
+
+def service(config):
+    p = subprocess.run([config.get("opencode", str(OPENCODE)), "service", "status"],
+                       capture_output=True, timeout=15, creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+    if p.returncode:
+        raise ValueError("OpenCode 后台服务未就绪；不自动退回私有实例")
+    return local_server(p.stdout.decode("utf-8", "strict").strip())
+
+
+def native_api(config, server, operation, body=None, session_id=None, cwd=None):
+    # CLI 负责本机服务认证；桥不复制或记录凭据。
+    if service(config) != local_server(server):
+        raise ValueError("OpenCode 后台服务地址已变化；拒绝向其他服务发送任务")
+    # 本机 2.0.20 的 --server 不继承后台服务认证，会要求 OPENCODE_PASSWORD。
+    # 使用 CLI 自管连接；上面的 service status 核对将其固定到已记录服务。
+    args = [config.get("opencode", str(OPENCODE)), "api", operation]
+    if session_id:
+        if not re.fullmatch(r"ses_[A-Za-z0-9]+", session_id):
+            raise ValueError("原生会话编号非法")
+        args += ["--param", "sessionID=" + session_id]
+    if body is not None:
+        args += ["--data", json.dumps(body, ensure_ascii=False)]
+    p = subprocess.run(args, cwd=cwd, capture_output=True, timeout=30,
+                       creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+    if p.returncode:
+        raise ValueError("OpenCode API 失败（exit %s）：%s %s" %
+                         (p.returncode, p.stdout.decode("utf-8", "replace"), p.stderr.decode("utf-8", "replace")))
+    value = json.loads(p.stdout)
+    return value.get("data", value) if isinstance(value, dict) else value
 
 
 def facts(config):
@@ -43,7 +97,7 @@ def facts(config):
                 "model_selection": "原生 headless 配置；尚未运行验收"},
         "opencode": {"entry": config.get("opencode", str(OPENCODE)),
                      "entry_exists": Path(config.get("opencode", str(OPENCODE))).is_file(),
-                     "mode": "--standalone 私有实例"},
+                     "mode": "shared：复用本机后台服务；旧契约缺省 standalone"},
         "platform": os.name,
         "upstream_request_limit": "未实证原生请求层；外层仅实现单任务与墙钟超时，未动态验收",
     }

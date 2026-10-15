@@ -127,6 +127,12 @@ def validate(task):
         raise ValueError("repo 必须是已有仓库的绝对目录")
     if task["executor"] not in ("dsh", "opencode"):
         raise ValueError("executor 只支持 dsh / opencode")
+    if "title" in task and (not isinstance(task["title"], str) or not 1 <= len(task["title"].strip()) <= 100):
+        raise ValueError("title 必须为 1–100 字符的短标题")
+    if task.get("opencode_mode", "standalone") not in ("standalone", "shared"):
+        raise ValueError("opencode_mode 只支持 shared / standalone")
+    if task["executor"] != "opencode" and "opencode_mode" in task:
+        raise ValueError("opencode_mode 仅用于 OpenCode")
     for key in ("allowed_paths", "artifacts", "completion_criteria"):
         if not isinstance(task.get(key), list) or not task[key] or not all(isinstance(x, str) and x.strip() for x in task[key]):
             raise ValueError(key + " 必须是非空字符串数组")
@@ -245,8 +251,12 @@ def plan(store, task_id, config):
               "base_commit": commit, "repo": str(repo), "executor": task["executor"], "model": task.get("model"),
               "inputs": inputs, "allowed_paths": task["allowed_paths"], "timeout_seconds": task["timeout_seconds"],
               "executable_sha256": entry_hashes,
-              "effects": ["新增一个 detached Git worktree", "启动一个新的执行器及其私有子进程",
-                          "执行器可能调用模型并消耗额度", "超时／取消只结束桥登记的自身进程树"],
+              "opencode_mode": task.get("opencode_mode", "standalone") if task["executor"] == "opencode" else None,
+              "title": task.get("title", task_id),
+              "effects": ["新增一个 detached Git worktree",
+                          "先建共享服务空会话，确认客户端可见后再运行" if adapters.shared(task) else "启动一个新的执行器及其私有子进程",
+                          "执行器可能调用模型并消耗额度",
+                          "共享会话用原生 interrupt；停稳未确认时保持 BLOCKED" if adapters.shared(task) else "超时／取消只结束桥登记的自身进程树"],
               "limitations": ["尚无真实任务验收", "原生模型请求节流／重试／步数上限未实证，不能当硬预算",
                               "worktree 不等于强安全沙箱；路径检查发现越界后拒收",
                               "Git 忽略的文件不纳入快照；外部路径写入不能由事后 diff 证明不存在",
@@ -278,7 +288,7 @@ def prompt_for(task, directory, attempt):
     return "\n".join([
         "你是此任务的执行者。用简体中文交付。不要创建子代理，不要自动执行测试。",
         "只在当前工作区内修改契约允许的路径；不要提交、切分支或修改 .git、外部配置、供应商、桌面或服务。",
-        "输入文件和完整契约：" + str(directory / ("contract.r" + str(attempt["revision"]) + ".json")),
+        "完整契约已内联，无需读取工作区外文件：" + json.dumps(task, ensure_ascii=False),
         "task_id=" + task["task_id"] + " attempt_id=" + attempt["attempt_id"],
         "目标：" + task["goal"],
         "允许修改：" + json.dumps(task["allowed_paths"], ensure_ascii=False),
@@ -289,17 +299,24 @@ def prompt_for(task, directory, attempt):
     ])
 
 
-def run(store, task_id, config, expected, approve, acknowledge):
+def run(store, task_id, config, expected, approve, acknowledge, prepare_only=False, confirm_visible=False):
     if not approve or not acknowledge:
         raise ValueError("先审阅 plan；执行需 --approve-start 和 --ack-unmetered，不能将未实证的预算当已限制")
     directory = task_dir(store, task_id)
     with writer(store):
         task, state = load_task(directory)
-        if state["status"] not in ("ready", "rework"):
+        if state["status"] not in ("ready", "rework", "prepared"):
             raise ValueError("任务当前状态不允许启动；失败后的重派先 revise")
+        is_shared = adapters.shared(task)
+        if prepare_only and (not is_shared or state["status"] == "prepared"):
+            raise ValueError("仅 shared 模式的待规划任务可以创建空会话；不会重复创建")
+        if is_shared and not prepare_only and (state["status"] != "prepared" or not confirm_visible):
+            raise ValueError("先 prepare 创建空会话，并确认真实客户端可见后再发送提示词")
         approved = plan(store, task_id, config)
         if approved["plan_sha256"] != expected:
             raise ValueError("计划已变化或哈希不匹配；必须重新审阅")
+        if state["status"] == "prepared":
+            return resume_shared(store, directory, task, state, config, approved, expected, confirm_visible)
         attempt_id = "attempt-" + uuid.uuid4().hex
         attempt_dir = directory / "attempts" / attempt_id
         attempt_dir.mkdir(parents=True)
@@ -320,6 +337,24 @@ def run(store, task_id, config, expected, approve, acknowledge):
                 if before.get(ref) != expected_hash:
                     raise ValueError("工作区输入与批准的计划不一致：" + ref)
             atomic(attempt_dir / "before.json", before)
+            if is_shared:
+                server = adapters.service(config)
+                # 先写发送意图。超时或崩溃后保留现场，禁止自动再建一次。
+                atomic(attempt_dir / "native-create-intent.json", {"server": server, "time": now()})
+                info = adapters.native_api(config, server, "session.create",
+                                          {"title": task.get("title", task_id),
+                                           "location": {"directory": str(worktree)}}, cwd=worktree)
+                session_id = info.get("id") if isinstance(info, dict) else None
+                if not isinstance(session_id, str) or not re.fullmatch(r"ses_[A-Za-z0-9]+", session_id):
+                    raise ValueError("session.create 未返回可核对的 session ID；不发送提示词")
+                native = {"server": server, "session_id": session_id, "title": task.get("title", task_id),
+                          "directory": str(worktree), "model": task.get("model"), "created_at": now(),
+                          "prompt_sent": False, "visibility": "awaiting_client_confirmation", "session": info}
+                atomic(attempt_dir / "native-session.json", native)
+                state.update(status="prepared", current_attempt=attempt_id, acceptance="BLOCKED")
+                atomic(directory / "state.json", state)
+                event(directory, "native_session_created", attempt_id=attempt_id, session_id=session_id)
+                return state
             command, input_bytes = adapters.build(task, prompt_for(task, directory, attempt), config)
         except Exception as error:
             result = {"attempt_id": attempt_id, "task_id": task_id, "revision": state["revision"],
@@ -333,6 +368,41 @@ def run(store, task_id, config, expected, approve, acknowledge):
             atomic(directory / "state.json", state)
             event(directory, "preparation_failed", attempt_id=attempt_id, error=scrub(str(error)))
             return {**state, "result_file": str(attempt_dir / "result.json")}
+        return execute_attempt(directory, task, state, config, expected, attempt_dir, attempt,
+                               worktree, git_marker, before, command, input_bytes)
+
+
+def resume_shared(store, directory, task, state, config, approved, expected, confirm_visible):
+    attempt_dir = directory / "attempts" / state["current_attempt"]
+    attempt = read(attempt_dir / "attempt.json")
+    native = read(attempt_dir / "native-session.json")
+    worktree = recorded_worktree(attempt_dir)
+    if attempt["plan_sha256"] != expected or native.get("prompt_sent") or (attempt_dir / "prompt-intent.json").exists():
+        raise ValueError("计划变化或提示词已提交／提交状态不明；禁止重复发送")
+    before = read(attempt_dir / "before.json")
+    if snapshot(worktree) != before or git(worktree, "rev-parse", "HEAD").decode().strip() != approved["base_commit"]:
+        raise ValueError("空会话准备后工作区发生变化；拒绝执行")
+    info = adapters.native_api(config, native["server"], "session.get", session_id=native["session_id"], cwd=worktree)
+    if not isinstance(info, dict) or info.get("id") != native["session_id"]:
+        raise ValueError("原生会话回读不一致")
+    prompt = prompt_for(task, directory, attempt)
+    command, input_bytes = adapters.build(task, prompt, {**config, "native_session": native})
+    native.update(visibility="user_confirmed" if confirm_visible else "unverified", prompt_sha256=digest(prompt.encode("utf-8")))
+    atomic(attempt_dir / "native-session.json", native)
+    # 任何后续异常不自动重派，避免双重计费。
+    atomic(attempt_dir / "prompt-intent.json", {"time": now(), "prompt_sha256": native["prompt_sha256"],
+                                               "session_id": native["session_id"]})
+    return execute_attempt(directory, task, state, config, expected, attempt_dir, attempt, worktree,
+                           digest((worktree / ".git").read_bytes()), before, command, input_bytes)
+
+
+def execute_attempt(directory, task, state, config, expected, attempt_dir, attempt, worktree,
+                    git_marker, before, command, input_bytes):
+        attempt_id = attempt["attempt_id"]
+        approved = attempt
+        task_id = task["task_id"]
+        native_path = attempt_dir / "native-session.json"
+        native = read(native_path) if native_path.is_file() else None
         state.update(status="running", current_attempt=attempt_id, acceptance="BLOCKED", started_at=now())
         atomic(directory / "state.json", state)
         event(directory, "starting", attempt_id=attempt_id, plan_sha256=expected)
@@ -340,7 +410,11 @@ def run(store, task_id, config, expected, approve, acknowledge):
         exit_code = None
         stop_reason = None
         native_errors = []
-        session_id = None
+        session_id = native["session_id"] if native else None
+        native_warnings = []
+        stop_confirmed = None
+        started_ms = int(time.time() * 1000)
+        interrupted = False
         streams = queue.Queue(maxsize=256)
         def pump(stream, name):
             try:
@@ -363,10 +437,15 @@ def run(store, task_id, config, expected, approve, acknowledge):
                     pass
         try:
             deadline = time.monotonic() + task["timeout_seconds"]
+            if native and adapters.service(config) != native["server"]:
+                raise ValueError("发送前 OpenCode 后台服务发生变化；拒绝发送提示词")
             flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
             process = subprocess.Popen(command, cwd=worktree, stdin=subprocess.PIPE,
                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                        creationflags=flags, start_new_session=os.name != "nt")
+            if native:
+                native.update(prompt_sent=True, observer_pid=process.pid, observer_started_at=now())
+                atomic(native_path, native)
             try:
                 tree = adapters.ProcessTree(process)
             except Exception:
@@ -390,6 +469,14 @@ def run(store, task_id, config, expected, approve, acknowledge):
                         stop_reason = "timeout"
                     if stop_reason:
                         stopped_at = stopped_at or time.monotonic()
+                        if native and not interrupted:
+                            interrupted = True
+                            try:
+                                receipt = adapters.native_api(config, native["server"], "session.interrupt",
+                                                              session_id=session_id, cwd=worktree)
+                                atomic(attempt_dir / "interrupt.json", {"time": now(), "receipt": receipt})
+                            except Exception as error:
+                                native_errors.append({"stage": "interrupt", "message": scrub(str(error))})
                         tree.close()
                         if process.poll() is None:
                             process.wait(timeout=10)
@@ -417,10 +504,28 @@ def run(store, task_id, config, expected, approve, acknowledge):
                         except ValueError:
                             pass
                     if isinstance(parsed, dict):
-                        if parsed.get("type") == "thinking":
+                        if parsed.get("type") in ("thinking", "reasoning"):
                             continue  # 不向账本展示模型推理文本。
                         if task["executor"] == "dsh" and parsed.get("type") == "session":
                             session_id = parsed.get("sessionId")
+                        if task["executor"] == "opencode":
+                            observed = parsed.get("sessionID")
+                            if observed:
+                                if native and observed != session_id:
+                                    native_errors.append({"stage": "session", "message": "输出会话与指定会话不一致"})
+                                else:
+                                    session_id = observed
+                            part = parsed.get("part") or {}
+                            tool_state = part.get("state") or {}
+                            if tool_state.get("status") == "error":
+                                native_warnings.append({"stage": "tool", "tool": part.get("tool"),
+                                                        "message": tool_state.get("error", "原生工具失败")})
+                            if native:
+                                native.update(last_event=parsed.get("type"), last_event_at=now(),
+                                              warnings=native_warnings[-20:])
+                                if part.get("messageID") or parsed.get("messageID"):
+                                    native["message_id"] = part.get("messageID") or parsed["messageID"]
+                                atomic(native_path, native)
                         if parsed.get("type") == "error":
                             native_errors.append(parsed)
                         if task["executor"] == "dsh" and parsed.get("phase") == "turn_end":
@@ -437,6 +542,14 @@ def run(store, task_id, config, expected, approve, acknowledge):
             stop_reason = stop_reason or "runner_error"
             native_errors.append({"message": scrub(str(error)), "exception": type(error).__name__})
         finally:
+            if native and stop_reason and process and not interrupted:
+                interrupted = True
+                try:
+                    receipt = adapters.native_api(config, native["server"], "session.interrupt",
+                                                  session_id=session_id, cwd=worktree)
+                    atomic(attempt_dir / "interrupt.json", {"time": now(), "receipt": receipt})
+                except Exception as error:
+                    native_errors.append({"stage": "interrupt", "message": scrub(str(error))})
             if tree:
                 tree.close()
             if process and tree and process.poll() is None:
@@ -446,6 +559,21 @@ def run(store, task_id, config, expected, approve, acknowledge):
                     native_errors.append({"stage": "stop", "message": "自身进程未确认停止；需只读核查 PID"})
             if process and process.poll() is not None:
                 exit_code = process.returncode
+            if native:
+                # 即使观察进程结束，也要向原生服务回读；不将断开观察等同于停止任务。
+                try:
+                    info = adapters.native_api(config, native["server"], "session.get", session_id=session_id, cwd=worktree)
+                    idle = info.get("time", {}).get("idle", 0)
+                    stop_confirmed = isinstance(idle, (int, float)) and idle >= started_ms
+                    native.update(session=info, stop_confirmed=stop_confirmed, observed_at=now())
+                    atomic(native_path, native)
+                    if not stop_confirmed:
+                        native_errors.append({"stage": "native_status", "message": "未确认原生会话已停稳；禁止重派或接收"})
+                    elif info.get("outcome") != "succeeded" and not stop_reason:
+                        native_errors.append({"stage": "native_outcome", "message": str(info.get("outcome"))})
+                except Exception as error:
+                    stop_confirmed = False
+                    native_errors.append({"stage": "native_status", "message": scrub(str(error))})
         # 失败同样留证；不自动修复、不清理 worktree。
         try:
             if digest((worktree / ".git").read_bytes()) != git_marker:
@@ -463,17 +591,20 @@ def run(store, task_id, config, expected, approve, acknowledge):
         except Exception as error:
             changes, violations, missing = [], [], []
             native_errors.append({"message": scrub(str(error)), "stage": "collect"})
-        failed = exit_code != 0 or bool(native_errors or violations or missing)
-        status = "cancelled" if stop_reason == "cancelled" else "failed" if failed or stop_reason else "awaiting_review"
+        failed = exit_code != 0 or bool(native_errors or violations or missing or stop_reason)
+        status = "stop_unconfirmed" if native and stop_confirmed is not True else "cancelled" if stop_reason == "cancelled" else "failed" if failed else "awaiting_review"
         result = {"attempt_id": attempt_id, "task_id": task_id, "revision": state["revision"],
                   "contract_sha256": state["contract_sha256"], "exit_code": exit_code, "stop_reason": stop_reason,
                   "session_id": session_id, "changes": changes, "violations": violations, "missing_artifacts": missing,
                   "native_errors": native_errors, "finished_at": now(), "acceptance": "FAIL" if failed else "BLOCKED",
+                  "native_warnings": native_warnings, "native_stop_confirmed": stop_confirmed,
                   "git_marker_sha256": git_marker,
                   "base_commit": approved["base_commit"],
                   "after_snapshot_sha256": digest(json_bytes(after)) if 'after' in locals() else None,
-                  "upstream_requests": None, "usage": None,
+                  "upstream_requests": None, "usage": native.get("session", {}).get("tokens") if native else None,
                   "usage_note": "保留原生 JSON 日志；未核实跨执行器 usage 语义，不估算次数或费用"}
+        if status == "stop_unconfirmed":
+            result["acceptance"] = "BLOCKED"
         atomic(attempt_dir / "result.json", result)
         current = read(directory / "state.json")
         if current["current_attempt"] != attempt_id or current["contract_sha256"] != result["contract_sha256"]:
@@ -489,7 +620,7 @@ def run(store, task_id, config, expected, approve, acknowledge):
 
 def cancel(store, task_id, expected_attempt, approved):
     if not approved:
-        raise ValueError("取消会结束桥自身任务进程树；需 --approve-cancel")
+        raise ValueError("取消会中断该原生会话或结束桥自身任务进程树；需 --approve-cancel")
     directory = task_dir(store, task_id)
     _, state = load_task(directory)
     if state["status"] != "running" or state["current_attempt"] != expected_attempt:
@@ -498,6 +629,21 @@ def cancel(store, task_id, expected_attempt, approved):
            {"attempt_id": expected_attempt, "requested_at": now()})
     return {"status": "cancel_requested", "attempt_id": expected_attempt,
             "acceptance": "BLOCKED", "note": "由持有进程组的运行器处理；请求写入不代表已停稳"}
+
+
+def native_status(store, task_id, config):
+    directory = task_dir(store, task_id)
+    task, state = load_task(directory)
+    if not adapters.shared(task) or not state.get("current_attempt"):
+        raise ValueError("此任务没有共享原生会话")
+    attempt_dir = directory / "attempts" / state["current_attempt"]
+    native = read(attempt_dir / "native-session.json")
+    info = adapters.native_api(config, native["server"], "session.get", session_id=native["session_id"])
+    # 单独记录，避免与执行线程的 native-session.json 竞争；不改结果或伪造回收。
+    observation = {"time": now(), "session": info, "session_id": native["session_id"],
+                   "note": "原生回读成功不等于桥已完成文件回收或用户验收"}
+    atomic(attempt_dir / "native-observation.json", observation)
+    return observation
 
 
 def review(store, task_id, decision, audit, user):
@@ -547,7 +693,7 @@ def revise(store, task_id, source):
     replacement = validate(read(source))
     with writer(store):
         task, state = load_task(directory)
-        if state["status"] in ("running", "accepted") or replacement["task_id"] != task_id:
+        if state["status"] in ("running", "prepared", "stop_unconfirmed", "accepted") or replacement["task_id"] != task_id:
             raise ValueError("运行中／已接收任务不能修订，且 task_id 必须相同")
         state["revision"] += 1
         atomic(directory / ("contract.r" + str(state["revision"]) + ".json"), replacement)
@@ -566,12 +712,13 @@ def main():
     subs = parser.add_subparsers(dest="command", required=True)
     subs.add_parser("doctor")
     p = subs.add_parser("submit"); p.add_argument("contract", type=Path)
-    for name in ("plan", "status", "run", "cancel", "review", "revise"):
+    for name in ("plan", "status", "prepare", "run", "cancel", "review", "revise"):
         p = subs.add_parser(name); p.add_argument("task_id")
-        if name == "run":
+        if name in ("prepare", "run"):
             p.add_argument("--plan-sha256", required=True)
             p.add_argument("--approve-start", action="store_true")
             p.add_argument("--ack-unmetered", action="store_true")
+            p.add_argument("--confirm-visible", action="store_true")
         if name == "cancel":
             p.add_argument("--attempt-id", required=True)
             p.add_argument("--approve-cancel", action="store_true")
@@ -590,7 +737,7 @@ def main():
     elif args.command == "submit": result = submit(store, args.contract)
     elif args.command == "plan": result = plan(store, args.task_id, config)
     elif args.command == "status": result = load_task(task_dir(store, args.task_id))[1]
-    elif args.command == "run": result = run(store, args.task_id, config, args.plan_sha256, args.approve_start, args.ack_unmetered)
+    elif args.command in ("prepare", "run"): result = run(store, args.task_id, config, args.plan_sha256, args.approve_start, args.ack_unmetered, args.command == "prepare", args.confirm_visible)
     elif args.command == "cancel": result = cancel(store, args.task_id, args.attempt_id, args.approve_cancel)
     elif args.command == "review": result = review(store, args.task_id, args.decision, args.audit_evidence, args.user_evidence)
     else: result = revise(store, args.task_id, args.contract)

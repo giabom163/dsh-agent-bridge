@@ -35,6 +35,14 @@ class BridgeHTTPServer(ThreadingHTTPServer):
         self.config = config
         self.jobs = {}
         self.jobs_lock = threading.Lock()
+        # 固定启动时加载的字节，磁盘之后变化不会冒充已热加载。
+        loaded = {module.__name__: bridge.digest(module.__loader__.get_data(module.__file__))
+                  for module in (bridge, bridge.adapters)}
+        loaded.update({name: bridge.digest((ROOT / name).read_bytes())
+                       for name in ("webui.py", "web/app.js", "web/index.html", "web/style.css")})
+        self.runtime = {"pid": __import__("os").getpid(), "started_at": bridge.now(), "store": str(self.store),
+                        "loaded_sha256": loaded, "bridge_module": bridge.__file__,
+                        "build": "shared-session-20261015"}
 
 
 class BridgeHandler(BaseHTTPRequestHandler):
@@ -88,18 +96,43 @@ class BridgeHandler(BaseHTTPRequestHandler):
         task, state = bridge.load_task(directory)
         current = state.get("current_attempt")
         result = None
+        native = attempt_info = observation = None
+        activity = []
         if current:
             attempt = directory / "attempts" / current
             result_path = attempt / "result.json"
+            attempt_info = bridge.read(attempt / "attempt.json")
+            if (attempt / "native-session.json").is_file():
+                native = bridge.read(attempt / "native-session.json")
+            if (attempt / "native-observation.json").is_file():
+                observation = bridge.read(attempt / "native-observation.json")
             if result_path.is_file():
                 result = bridge.read(result_path)
+            log = attempt / "stdout.log"
+            if log.is_file():
+                with log.open("rb") as stream:
+                    stream.seek(max(0, log.stat().st_size - 65536))
+                    lines = stream.read(65536).decode("utf-8", "replace").splitlines()
+                for line in lines:
+                    try:
+                        item = json.loads(line)
+                        part = item.get("part") or {}
+                        if item.get("type") in ("text", "tool_use", "error", "step_finish"):
+                            activity.append({"type": item.get("type"), "tool": part.get("tool"),
+                                             "status": (part.get("state") or {}).get("status"),
+                                             "text": str(part.get("text") or item.get("error") or "")[-4000:]})
+                    except (ValueError, AttributeError, TypeError):
+                        continue
         with self.server.jobs_lock:
             job = self.server.jobs.get(task_id)
-        return {"task": task, "state": state, "result": result, "job": job}
+        return {"task": task, "state": state, "result": result, "job": job,
+                "native": native, "native_observation": observation, "attempt": attempt_info, "activity": activity[-12:]}
 
     def do_GET(self):
         try:
             path = urlsplit(self.path).path
+            if path == "/api/runtime":
+                return self._send(200, self.server.runtime)
             if path == "/":
                 page = (WEB_ROOT / "index.html").read_bytes()
                 return self._send(200, page, "text/html; charset=utf-8")
@@ -171,18 +204,24 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 source = submissions / f"{task['task_id']}-{uuid.uuid4().hex[:12]}.json"
                 bridge.atomic(source, task)
                 return self._send(201, bridge.submit(self.server.store, source))
-            match = re.fullmatch(r"/api/tasks/([^/]+)/(plan|run|cancel|revise|review)", path)
+            match = re.fullmatch(r"/api/tasks/([^/]+)/(plan|prepare|run|native-status|cancel|revise|review)", path)
             if not match:
                 return self._error(404, "接口不存在")
             task_id, action = self._safe_task_id(match.group(1)), match.group(2)
             if action == "plan":
                 return self._send(200, bridge.plan(self.server.store, task_id, self.server.config))
-            if action == "run":
+            if action == "native-status":
+                return self._send(200, bridge.native_status(self.server.store, task_id, self.server.config))
+            if action in ("prepare", "run"):
                 plan_hash = body.get("plan_sha256")
                 if not isinstance(plan_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", plan_hash):
                     raise ValueError("需要有效的计划 SHA-256")
                 if body.get("approve_start") is not True or body.get("ack_unmetered") is not True:
                     raise PermissionError("启动须在界面明确批准计划及未实证预算限制")
+                task, _ = bridge.load_task(bridge.task_dir(self.server.store, task_id))
+                visible = body.get("confirm_visible") is True
+                if action == "run" and bridge.adapters.shared(task) and not visible:
+                    raise PermissionError("先在真实 OpenCode 客户端找到空会话，再确认可见并发送提示词")
                 with self.server.jobs_lock:
                     active = [key for key, value in self.server.jobs.items() if value.get("running")]
                     if active:
@@ -192,7 +231,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 def execute():
                     try:
                         result = bridge.run(self.server.store, task_id, self.server.config,
-                                            plan_hash, True, True)
+                                            plan_hash, True, True, action == "prepare", visible)
                         job = {"running": False, "finished_at": bridge.now(), "result": result}
                     except Exception as error:
                         job = {"running": False, "finished_at": bridge.now(),
