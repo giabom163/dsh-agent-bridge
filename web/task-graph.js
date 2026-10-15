@@ -1,0 +1,277 @@
+/* B1 桥只读任务协同图。
+ *
+ * 数据来源只有 web/app.js 已获取的 /api/tasks 列表（每条为当前尝试，不是完整历史）。
+ * 本组件自身不发起任何网络请求，不请求 native-status，也不触发模型请求。
+ * 节点是真实任务；边只来自 task.dependencies；使用 Cytoscape 内置 breadthfirst 布局，
+ * 不加载任何布局扩展；Cytoscape 缺失时明确报错，不做假图降级。
+ */
+(function (global) {
+  "use strict";
+
+  // 契约 10 个任务状态的中文完整文字（docs/B1-contract.md 第 3 行）。
+  var STATUS_LABELS = {
+    ready: "待规划",
+    prepared: "空会话待确认",
+    running: "执行中",
+    awaiting_review: "待审查",
+    awaiting_user: "待用户验收",
+    accepted: "已接收",
+    rework: "返修待规划",
+    failed: "失败",
+    cancelled: "已取消",
+    stop_unconfirmed: "停止未确认"
+  };
+  // 桥取消 API 的临时过程标签，不属于契约 10 状态，单独保留。
+  var PROCESS_LABELS = { cancel_requested: "取消中（过程标签）" };
+  // 3 个验收值，独立于任务状态。
+  var ACCEPTANCE_LABELS = { PASS: "通过", FAIL: "失败", BLOCKED: "阻塞" };
+
+  function esc(value) {
+    return String(value == null ? "" : value).replace(/[&<>"']/g, function (ch) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch];
+    });
+  }
+  function blank(value) { return value === null || value === undefined || value === ""; }
+  function safeClass(value) { return String(value == null ? "unknown" : value).replace(/[^a-z0-9_-]/gi, "_"); }
+
+  function statusLabel(value) {
+    if (blank(value)) { return "未知（状态未记录）"; }
+    if (STATUS_LABELS[value]) { return STATUS_LABELS[value]; }
+    if (PROCESS_LABELS[value]) { return PROCESS_LABELS[value]; }
+    return "未知（" + value + "）"; // 保留未知原值，不折叠成已知状态
+  }
+  function acceptanceLabel(value) {
+    if (blank(value)) { return "未知（未记录）"; }
+    if (ACCEPTANCE_LABELS[value]) { return ACCEPTANCE_LABELS[value]; }
+    return "未知（" + value + "）"; // 不默认 PASS
+  }
+  function modelLabel(value) { return blank(value) ? "未记录" : String(value); }
+  function badgeClass(value) { return "badge " + safeClass(value); }
+  function prettyTime(value) {
+    if (!value) { return "尚未成功"; }
+    var date = new Date(value);
+    return isNaN(date.valueOf()) ? "尚未成功" : date.toLocaleString("zh-CN", { hour12: false });
+  }
+
+  function mount(options) {
+    options = options || {};
+    var el = document.getElementById(options.graphId || "taskGraph");
+    var listEl = document.getElementById(options.listId || "graphList");
+    var statusEl = document.getElementById(options.statusId || "graphStatus");
+    var noteEl = document.getElementById(options.noteId || "graphNote");
+    var emptyEl = document.getElementById(options.emptyId || "graphEmpty");
+    var errorEl = document.getElementById(options.errorId || "graphError");
+    var onSelect = typeof options.onSelect === "function" ? options.onSelect : null;
+
+    var state = { tasks: [], filter: "", selected: null, missing: [], connected: true, lastSuccessAt: null };
+
+    var controller = {
+      available: false,
+      error: null,
+      update: function () {},
+      setFilter: function () {},
+      select: function () {},
+      setConnection: function () {},
+      destroy: function () {}
+    };
+
+    function showError(message) {
+      controller.error = message;
+      if (errorEl) { errorEl.hidden = false; errorEl.textContent = message; }
+    }
+    function statusLine(text, disconnected) {
+      if (!statusEl) { return; }
+      statusEl.textContent = text;
+      statusEl.classList.toggle("disconnected", !!disconnected);
+    }
+
+    if (!el) {
+      showError("缺少图容器，无法渲染协同图。");
+      return controller;
+    }
+    if (!global.cytoscape || typeof global.cytoscape !== "function") {
+      // 组件缺失明确报错；任务表仍可用。
+      showError("Cytoscape core 未加载（/vendor/cytoscape.min.js）。协同图不可用；任务表与详情仍可使用，不做假图降级。");
+      controller.setConnection = function (connected, lastSuccessAt) {
+        statusLine("协同图不可用 · " + (connected ? "连接正常" : "已断连 · 最后成功刷新 " + prettyTime(lastSuccessAt)), true);
+      };
+      return controller;
+    }
+    if (errorEl) { errorEl.hidden = true; }
+
+    var cy = global.cytoscape({
+      container: el,
+      elements: [],
+      wheelSensitivity: 0.2,
+      style: [
+        { selector: "node", style: {
+          "background-color": "#eef2f0", "border-width": 2, "border-color": "#c7d3cd",
+          "label": "data(label)", "font-size": 10, "color": "#1e2a27",
+          "text-valign": "bottom", "text-margin-y": 5, "width": 32, "height": 32,
+          "text-wrap": "wrap", "text-max-width": 92 } },
+        { selector: "node.status-ready, node.status-prepared, node.status-awaiting_review, node.status-awaiting_user",
+          style: { "background-color": "#edf5ef", "border-color": "#4c9a69" } },
+        { selector: "node.status-running, node.status-cancel_requested",
+          style: { "background-color": "#fff5e7", "border-color": "#d89b36" } },
+        { selector: "node.status-accepted", style: { "background-color": "#226b53", "border-color": "#164b3a", "color": "#164b3a" } },
+        { selector: "node.status-failed, node.status-cancelled, node.status-stop_unconfirmed",
+          style: { "background-color": "#fff0ee", "border-color": "#ce625a" } },
+        { selector: "node.status-rework, node.status-unknown",
+          style: { "background-color": "#f5f3ed", "border-color": "#a0aaa5" } },
+        { selector: "edge", style: {
+          "width": 2, "line-color": "#b9c6c0", "target-arrow-color": "#b9c6c0",
+          "target-arrow-shape": "triangle", "curve-style": "bezier", "arrow-scale": 0.9 } },
+        { selector: "node.selected", style: { "border-width": 4, "border-color": "#226b53" } },
+        { selector: ".filtered-out", style: { "display": "none" } }
+      ],
+      layout: { name: "preset" }
+    });
+
+    function matches(row) {
+      if (!state.filter) { return true; }
+      var task = row.task || {};
+      // 与表格同一过滤字段，保证图与搜索同步。
+      return (row.task_id + " " + (task.goal || "")).toLowerCase().indexOf(state.filter) >= 0;
+    }
+
+    function buildElements(tasks) {
+      var nodes = [], edges = [], seen = Object.create(null), missing = [];
+      tasks.forEach(function (row) {
+        var task = row.task || {}, s = row.state || {};
+        var id = row.task_id || task.task_id;
+        if (!id) { return; }
+        seen[id] = true;
+        var statusValue = blank(s.status) ? "" : String(s.status);
+        nodes.push({ data: {
+          id: id,
+          label: task.title || task.goal || id,
+          status: statusValue
+        }, classes: "status-" + safeClass(blank(statusValue) ? "unknown" : statusValue) });
+      });
+      tasks.forEach(function (row) {
+        var task = row.task || {};
+        var owner = row.task_id || task.task_id;
+        var deps = Array.isArray(task.dependencies) ? task.dependencies : [];
+        deps.forEach(function (dep) {
+          if (!seen[dep]) { missing.push({ dep: dep, owner: owner }); return; }
+          edges.push({ data: { id: dep + "->" + owner, source: dep, target: owner } });
+        });
+      });
+      return { nodes: nodes, edges: edges, missing: missing };
+    }
+
+    function renderList() {
+      if (!listEl) { return; }
+      var rows = state.tasks.filter(matches);
+      if (!rows.length) {
+        listEl.innerHTML = '<li class="graph-list-empty">' +
+          (state.tasks.length ? "没有匹配搜索的任务。" : "暂无任务。") + "</li>";
+        return;
+      }
+      listEl.innerHTML = rows.map(function (row) {
+        var task = row.task || {}, s = row.state || {};
+        var deps = Array.isArray(task.dependencies) ? task.dependencies : [];
+        return '<li class="' + (state.selected === row.task_id ? "selected" : "") + '">' +
+          '<button type="button" class="graph-list-item" data-id="' + esc(row.task_id) + '">' +
+          esc(task.title || task.goal || row.task_id) + "</button>" +
+          '<span class="' + badgeClass(s.status) + '">' + esc(statusLabel(s.status)) + "</span>" +
+          '<span class="graph-list-accept">验收：' + esc(acceptanceLabel(s.acceptance)) + "</span>" +
+          '<span class="graph-list-model">模型：' + esc(modelLabel(task.model)) + "</span>" +
+          (deps.length ? '<span class="graph-list-deps">依赖：' + esc(deps.join("、")) + "</span>" : "") +
+          "</li>";
+      }).join("");
+      listEl.querySelectorAll("button[data-id]").forEach(function (button) {
+        button.addEventListener("click", function () { choose(button.dataset.id); });
+      });
+    }
+
+    function renderNote() {
+      if (!noteEl) { return; }
+      var parts = ['<span>来源：GET /api/tasks（每条为当前尝试，非完整历史）</span>'];
+      if (state.missing.length) {
+        parts.push("<span>缺失依赖：" + state.missing.map(function (m) {
+          return esc(m.dep) + "（被 " + esc(m.owner) + " 引用，但不在返回列表中；不伪造其节点或状态）";
+        }).join("；") + "</span>");
+      } else if (state.tasks.length) {
+        parts.push("<span>依赖边均来自 task.dependencies。</span>");
+      }
+      noteEl.innerHTML = parts.join("");
+    }
+
+    function updateEmpty() {
+      if (emptyEl) { emptyEl.hidden = state.tasks.length !== 0; }
+      if (el) { el.classList.toggle("graph-canvas-empty", state.tasks.length === 0); }
+    }
+
+    function applyFilter() {
+      cy.nodes().forEach(function (node) {
+        var task = null;
+        for (var i = 0; i < state.tasks.length; i++) {
+          if (state.tasks[i].task_id === node.id()) { task = state.tasks[i]; break; }
+        }
+        node.toggleClass("filtered-out", !(task && matches(task)));
+      });
+      cy.edges().forEach(function (edge) {
+        edge.toggleClass("filtered-out",
+          edge.source().hasClass("filtered-out") || edge.target().hasClass("filtered-out"));
+      });
+    }
+
+    function choose(taskId) {
+      controller.select(taskId);
+      if (onSelect) { onSelect(taskId); }
+    }
+
+    controller.available = true;
+    controller.update = function (tasks) {
+      state.tasks = Array.isArray(tasks) ? tasks : [];
+      var built = buildElements(state.tasks);
+      state.missing = built.missing;
+      cy.elements().remove();
+      cy.add(built.nodes.concat(built.edges));
+      cy.layout({ name: "breadthfirst", directed: true, spacingFactor: 1.15, padding: 26,
+                  fit: true, animate: false, nodeDimensionsIncludeLabels: true }).run();
+      applyFilter();
+      renderList();
+      renderNote();
+      updateEmpty();
+    };
+    controller.setFilter = function (query) {
+      state.filter = String(query == null ? "" : query).trim().toLowerCase();
+      applyFilter();
+      renderList();
+    };
+    controller.select = function (taskId) {
+      state.selected = taskId;
+      cy.nodes().removeClass("selected");
+      var node = cy.getElementById(taskId);
+      if (node && node.length) { node.addClass("selected"); }
+      renderList();
+    };
+    controller.setConnection = function (connected, lastSuccessAt) {
+      state.connected = connected !== false;
+      state.lastSuccessAt = lastSuccessAt || null;
+      if (!state.connected) { cy.stop(); } // 断线不继续运行动画
+      if (el) { el.classList.toggle("graph-stale", !state.connected); }
+      statusLine(
+        (state.connected ? "已连接 · " : "已断连 · ") + "最后成功刷新 " + prettyTime(state.lastSuccessAt),
+        !state.connected);
+    };
+    controller.destroy = function () { cy.destroy(); };
+
+    cy.on("tap", "node", function (event) { choose(event.target.id()); });
+
+    return controller;
+  }
+
+  global.BridgeTaskGraph = {
+    mount: mount,
+    statusLabel: statusLabel,
+    acceptanceLabel: acceptanceLabel,
+    modelLabel: modelLabel,
+    badgeClass: badgeClass,
+    prettyTime: prettyTime,
+    STATUS_LABELS: STATUS_LABELS,
+    ACCEPTANCE_LABELS: ACCEPTANCE_LABELS
+  };
+})(typeof window !== "undefined" ? window : this);

@@ -39,10 +39,11 @@ class BridgeHTTPServer(ThreadingHTTPServer):
         loaded = {module.__name__: bridge.digest(module.__loader__.get_data(module.__file__))
                   for module in (bridge, bridge.adapters)}
         loaded.update({name: bridge.digest((ROOT / name).read_bytes())
-                       for name in ("webui.py", "web/app.js", "web/index.html", "web/style.css")})
+                       for name in ("webui.py", "web/app.js", "web/index.html", "web/style.css",
+                                    "web/task-graph.js", "web/vendor/cytoscape.min.js")})
         self.runtime = {"pid": __import__("os").getpid(), "started_at": bridge.now(), "store": str(self.store),
                         "loaded_sha256": loaded, "bridge_module": bridge.__file__,
-                        "build": "shared-session-20261015"}
+                        "build": "shared-session-graph-20261015"}
 
 
 class BridgeHandler(BaseHTTPRequestHandler):
@@ -142,6 +143,19 @@ class BridgeHandler(BaseHTTPRequestHandler):
             if path == "/style.css":
                 page = (WEB_ROOT / "style.css").read_bytes()
                 return self._send(200, page, "text/css; charset=utf-8")
+            # 静态资源逐项显式白名单：绝不按请求路径拼接文件路径。
+            if path == "/task-graph.js":
+                page = (WEB_ROOT / "task-graph.js").read_bytes()
+                return self._send(200, page, "text/javascript; charset=utf-8")
+            if path == "/vendor/cytoscape.min.js":
+                page = (WEB_ROOT / "vendor" / "cytoscape.min.js").read_bytes()
+                return self._send(200, page, "text/javascript; charset=utf-8")
+            if path == "/vendor/cytoscape-LICENSE":
+                page = (WEB_ROOT / "vendor" / "cytoscape-LICENSE").read_bytes()
+                return self._send(200, page, "text/plain; charset=utf-8")
+            if path == "/vendor/NOTICE.md":
+                page = (WEB_ROOT / "vendor" / "NOTICE.md").read_bytes()
+                return self._send(200, page, "text/markdown; charset=utf-8")
             if path == "/api/tasks":
                 tasks_dir = self.server.store / "tasks"
                 rows = []

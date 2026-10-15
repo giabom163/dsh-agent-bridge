@@ -1,5 +1,5 @@
 const $ = (id) => document.getElementById(id);
-const state = { tasks: [], selected: null, plans: new Map(), action: null, editTask: null };
+const state = { tasks: [], selected: null, plans: new Map(), action: null, editTask: null, connected: true, lastSuccessAt: null, graph: null };
 
 function esc(value) {
   return String(value ?? "").replace(/[&<>"']/g, (ch) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[ch]));
@@ -9,8 +9,20 @@ function prettyTime(value) {
   const date = new Date(value);
   return Number.isNaN(date.valueOf()) ? "—" : date.toLocaleString("zh-CN", {month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit",hour12:false});
 }
+const FALLBACK_STATUS = {ready:"待规划",prepared:"空会话待确认",running:"执行中",awaiting_review:"待审查",awaiting_user:"待用户验收",accepted:"已接收",rework:"返修待规划",failed:"失败",cancelled:"已取消",stop_unconfirmed:"停止未确认",cancel_requested:"取消中"};
 function labelStatus(value) {
-  return ({prepared:"空会话待确认",stop_unconfirmed:"原生停止未确认",ready:"待规划",rework:"待重新规划",running:"执行中",cancel_requested:"取消中",awaiting_review:"待审查",awaiting_user:"待用户验收",accepted:"已接收",failed:"失败",cancelled:"已取消"})[value] || value || "未知";
+  if (window.BridgeTaskGraph) return window.BridgeTaskGraph.statusLabel(value);
+  if (value === null || value === undefined || value === "") return "未知";
+  return FALLBACK_STATUS[value] || `未知（${value}）`;
+}
+function labelAcceptance(value) {
+  if (window.BridgeTaskGraph) return window.BridgeTaskGraph.acceptanceLabel(value);
+  if (value === null || value === undefined || value === "") return "未知（未记录）";
+  return ({PASS:"通过",FAIL:"失败",BLOCKED:"阻塞"})[value] || `未知（${value}）`;
+}
+function labelModel(value) {
+  if (window.BridgeTaskGraph) return window.BridgeTaskGraph.modelLabel(value);
+  return value === null || value === undefined || value === "" ? "未记录" : String(value);
 }
 function toast(message, error = false) {
   const item = $("toast"); item.textContent = message; item.className = `toast show${error ? " error" : ""}`;
@@ -25,11 +37,51 @@ async function api(path, options = {}) {
 async function refresh(keep = true) {
   try {
     const data = await api("/api/tasks"); state.tasks = data.tasks || [];
+    state.connected = true; state.lastSuccessAt = new Date().toISOString();
     $("taskCount").textContent = state.tasks.length;
     renderMetrics(); renderRows();
     if (state.selected && keep && state.tasks.some(x => x.task_id === state.selected)) await selectTask(state.selected);
     else if (!state.selected) $("detailPanel").innerHTML = placeholder();
-  } catch (error) { toast(error.message, true); }
+    renderGraph();
+  } catch (error) {
+    // 保留已有数据，但标记断连并显示旧的最后成功时间；不把旧数据当成新鲜。
+    state.connected = false;
+    renderGraph();
+    toast(error.message, true);
+  }
+}
+function renderGraph() {
+  updateConnection();
+  if (!state.graph) return;
+  state.graph.update(state.tasks);
+  state.graph.setFilter($("searchInput").value);
+  if (state.selected) state.graph.select(state.selected);
+  state.graph.setConnection(state.connected, state.lastSuccessAt);
+}
+function updateConnection() {
+  const el = $("connectionState"); if (!el) return;
+  const time = state.lastSuccessAt ? new Date(state.lastSuccessAt).toLocaleTimeString("zh-CN", {hour12:false}) : "尚未成功";
+  el.classList.toggle("dropped", !state.connected);
+  el.innerHTML = `<i></i> ${state.connected ? "本地连接" : `已断连 · 最后成功 ${esc(time)}`}`;
+  el.title = `最后成功刷新 ${time}`;
+}
+function initGraph() {
+  const errorEl = $("graphError");
+  if (!window.BridgeTaskGraph) {
+    errorEl.hidden = false;
+    errorEl.textContent = "协同图组件 /task-graph.js 未加载；任务表与详情仍可使用，不做假图降级。";
+    return null;
+  }
+  try {
+    const graph = window.BridgeTaskGraph.mount({graphId:"taskGraph", listId:"graphList", statusId:"graphStatus",
+      noteId:"graphNote", emptyId:"graphEmpty", errorId:"graphError", onSelect:(id) => selectTask(id)});
+    if (!graph.available && graph.error) toast(graph.error, true);
+    return graph.available ? graph : null;
+  } catch (error) {
+    errorEl.hidden = false;
+    errorEl.textContent = `协同图初始化失败：${error.message}`;
+    return null;
+  }
 }
 function renderMetrics() {
   const counts = {all:state.tasks.length,active:0,review:0,blocked:0};
@@ -64,6 +116,7 @@ function actionButtons(data) {
 }
 async function selectTask(id) {
   state.selected = id; renderRows();
+  if (state.graph) state.graph.select(id);
   try {
     const data = await api(`/api/tasks/${encodeURIComponent(id)}`); renderDetail(data);
   } catch (error) { toast(error.message, true); }
@@ -85,14 +138,14 @@ function renderDetail(data) {
   const warningSection = warnings.length ? `<div class="detail-section"><h3>原生工具警告</h3><div class="detail-text">${esc(warnings.map(x=>`${x.tool || x.stage}: ${x.message}`).join("\n"))}</div></div>` : "";
   const activity = data.activity?.length ? `<div class="detail-section"><h3>最近执行输出</h3><div class="detail-text">${esc(data.activity.map(x=>[x.type,x.tool,x.status,x.text].filter(Boolean).join(" · ")).join("\n\n"))}</div></div>` : "";
   const effects = plan ? `<div class="detail-section"><h3>执行计划 · ${esc(plan.plan_sha256.slice(0,12))}…</h3><div class="detail-text">${esc(plan.effects.join("\n"))}</div><div class="detail-subtle" style="margin-top:6px">${esc(plan.limitations.join("\n"))}</div></div>` : "";
-  const resultSection = result ? `<div class="detail-section"><h3>机器结果 · ${esc(result.acceptance || "BLOCKED")}</h3><div class="detail-text">退出码：${esc(result.exit_code)}\n状态：${esc(labelStatus(s.status))}\n变更文件：${esc((result.changes || []).map(x=>x.path).join(", ") || "无")}${result.native_errors?.length ? `\n错误：${esc(result.native_errors.map(x=>x.message).join("; "))}` : ""}</div></div>` : "";
+  const resultSection = result ? `<div class="detail-section"><h3>机器结果 · ${esc(labelAcceptance(result.acceptance))}</h3><div class="detail-text">退出码：${esc(result.exit_code)}\n状态：${esc(labelStatus(s.status))}\n变更文件：${esc((result.changes || []).map(x=>x.path).join(", ") || "无")}${result.native_errors?.length ? `\n错误：${esc(result.native_errors.map(x=>x.message).join("; "))}` : ""}</div></div>` : "";
   const observation = data.native_observation ? `<div class="detail-section"><h3>最近原生回读</h3><div class="detail-text">${esc(prettyTime(data.native_observation.time))}\n原生 outcome：${esc(data.native_observation.session?.outcome || "尚无结果")}\n原生 idle 时间：${esc(data.native_observation.session?.time?.idle || "尚无记录")}\n${esc(data.native_observation.note)}</div></div>` : "";
   const job = data.job?.running ? `<div class="detail-section"><h3>桥任务</h3><div class="detail-text">执行器正在运行。刷新可读取最新状态。</div></div>` : data.job?.error ? `<div class="detail-section"><h3>操作失败 · BLOCKED</h3><div class="detail-text">${esc(data.job.error)}</div></div>` : "";
   $("detailPanel").innerHTML = `<div class="detail-head"><div><h2>${esc(task.title || task.goal)}</h2><p>${esc(task.task_id)} · revision ${esc(s.revision)}</p></div><button class="icon-button detail-close" id="detailClose" title="关闭">×</button></div>
-    <div class="detail-meta"><div class="meta-box"><span>状态</span><b><span class="badge ${esc(s.status)}">${esc(labelStatus(s.status))}</span></b></div><div class="meta-box"><span>执行器</span><b>${esc(task.executor)}${task.model ? ` · ${esc(task.model)}` : ""}</b></div><div class="meta-box"><span>验收</span><b>${esc(s.acceptance || "BLOCKED")}</b></div><div class="meta-box"><span>最后更新</span><b>${esc(prettyTime(s.finished_at || s.started_at || s.created_at))}</b></div></div>
+    <div class="detail-meta"><div class="meta-box"><span>状态</span><b><span class="badge ${esc(s.status)}">${esc(labelStatus(s.status))}</span></b></div><div class="meta-box"><span>执行器 · 模型</span><b>${esc(task.executor)} · ${esc(labelModel(task.model))}</b></div><div class="meta-box"><span>验收（独立）</span><b>${esc(labelAcceptance(s.acceptance))}</b></div><div class="meta-box"><span>最后更新</span><b>${esc(prettyTime(s.finished_at || s.started_at || s.created_at))}</b></div></div>
     <div class="detail-section"><h3>任务目标</h3><div class="detail-text">${esc(task.goal)}</div></div>
     <div class="detail-section"><h3>允许修改</h3><div class="detail-text">${esc((task.allowed_paths || []).join("\n"))}</div></div>
-    <div class="detail-actions">${actionButtons(data)}</div><div class="detail-subtle">启动会新增 worktree 并运行新执行器，可能调用模型；桥未实证原生请求数量和预算限制。</div>${nativeSection}${observation}${effects}${job}${warningSection}${activity}${resultSection}`;
+    <div class="detail-actions">${actionButtons(data)}</div><div class="detail-subtle">详情为 state.current_attempt 的当前尝试，不是完整历史。启动会新增 worktree 并运行新执行器，可能调用模型；桥未实证原生请求数量和预算限制。</div>${nativeSection}${observation}${effects}${job}${warningSection}${activity}${resultSection}`;
   $("detailClose").addEventListener("click", () => {state.selected=null; renderRows(); $("detailPanel").innerHTML=placeholder();});
   document.querySelectorAll("[data-action]").forEach(button => button.addEventListener("click", () => handleAction(button.dataset.action, data)));
 }
@@ -187,7 +240,8 @@ $("confirmActionButton").addEventListener("click", async () => {
 $("newTaskButton").addEventListener("click",()=>openTaskDialog());
 $("emptyNewButton").addEventListener("click",()=>openTaskDialog());
 $("refreshButton").addEventListener("click",()=>refresh());
-$("searchInput").addEventListener("input",renderRows);
+$("searchInput").addEventListener("input",()=>{ renderRows(); if (state.graph) state.graph.setFilter($("searchInput").value); });
 setInterval(()=>refresh(),5000);
+state.graph = initGraph();
 api("/api/runtime").then(r=>{ $("runtimeInfo").textContent=`${r.build} · PID ${r.pid} · bridge ${r.loaded_sha256.bridge.slice(0,12)}`; $("runtimeInfo").title=JSON.stringify(r,null,2); }).catch(e=>toast(e.message,true));
 refresh(false);
