@@ -108,6 +108,34 @@ class BridgeHandler(BaseHTTPRequestHandler):
             raise ValueError("任务编号非法")
         return task_id
 
+    def _attempts(self, directory):
+        """每次 attempt 的时间与结果，供「流程」页画 Timeline 水位条（只读，缺文件就留空）。"""
+        rows = []
+        attempts_dir = directory / "attempts"
+        if not attempts_dir.is_dir():
+            return rows
+        for entry in sorted(attempts_dir.iterdir(), key=lambda p: p.name):
+            if not entry.is_dir() or entry.is_symlink():
+                continue
+            row = {"attempt_id": entry.name}
+            for name, keys in (("attempt.json", ("started_at", "executor", "model", "worktree", "base_commit")),
+                               ("result.json", ("finished_at", "exit_code", "stop_reason", "violations",
+                                                "missing_artifacts", "native_errors", "review_gate", "acceptance",
+                                                "execution_facts"))):
+                if (entry / name).is_file():
+                    try:
+                        data = bridge.read(entry / name)
+                    except (OSError, ValueError):
+                        continue
+                    for key in keys:
+                        if key in data:
+                            row[key] = data[key]
+            if (entry / "interrupt.json").is_file():
+                row["interrupted"] = True
+            rows.append(row)
+        rows.sort(key=lambda r: str(r.get("started_at") or ""))
+        return rows
+
     def _task_data(self, task_id):
         directory = bridge.task_dir(self.server.store, task_id)
         task, state = bridge.load_task(directory)
@@ -145,7 +173,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
         return {"task": task, "state": state, "result": result, "job": job,
                 "native": native, "native_observation": observation, "attempt": attempt_info,
                 "activity": activity[-12:], "commands": self._commands(task_id),
-                "paths": self._paths(task_id, state)}
+                "paths": self._paths(task_id, state), "attempts": self._attempts(directory)}
 
     def _commands(self, task_id):
         """把常用 CLI 命令下发到界面，省掉另开命令行窗口。"""

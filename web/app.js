@@ -152,8 +152,50 @@ async function selectTask(id) {
     const data = await api(`/api/tasks/${encodeURIComponent(id)}`); renderDetail(data);
   } catch (error) { toast(error.message, true); }
 }
+function durationLabel(ms) {
+  if (!isFinite(ms) || ms < 0) return "—";
+  if (ms < 1000) return Math.round(ms) + " ms";
+  if (ms < 60000) return (ms / 1000).toFixed(1) + " s";
+  return Math.floor(ms / 60000) + " 分 " + Math.round((ms % 60000) / 1000) + " s";
+}
+// Timeline 水位视图（Temporal/Jaeger 那类）：每次 attempt 一条，按时间定位、按结果配色。
+function timelineHtml(s, data) {
+  const rows = (data && data.attempts) || [];
+  if (!rows.length) return `<p class="detail-subtle">还没有 attempt，暂无可画的时间线。</p>`;
+  const now = Date.now();
+  const marks = [];
+  rows.forEach((row, index) => {
+    const start = Date.parse(row.started_at || "");
+    if (!start) return;
+    const end = Date.parse(row.finished_at || "") || now;
+    const facts = row.execution_facts || {};
+    const failed = (row.exit_code !== undefined && row.exit_code !== 0)
+      || (facts.violations || row.violations || []).length
+      || (facts.missing_artifacts || row.missing_artifacts || []).length
+      || (row.native_errors || []).length;
+    marks.push({index: index + 1, row, start, end, failed,
+                tone: row.finished_at ? (failed ? "bad" : "ok") : "warn"});
+  });
+  if (!marks.length) return `<p class="detail-subtle">attempt 记录里没有开始时间，画不出水位条。</p>`;
+  const min = Math.min(...marks.map(m => m.start));
+  const max = Math.max(...marks.map(m => m.end), min + 1000);
+  const total = Math.max(max - min, 1000);
+  const bars = marks.map(m => {
+    const left = ((m.start - min) / total) * 100;
+    const width = Math.max(((m.end - m.start) / total) * 100, 1.2);
+    const label = [m.row.executor, m.row.model].filter(Boolean).join(" · ");
+    const facts = m.row.execution_facts || {};
+    return `<div class="tl-row"><div class="tl-label">#${m.index} <span>${esc(m.row.attempt_id.slice(-8))}</span><i>${esc(label)}</i></div>
+      <div class="tl-track"><div class="tl-bar ${m.tone}" style="left:${left.toFixed(2)}%;width:${width.toFixed(2)}%" title="${esc(prettyTime(m.row.started_at))} → ${esc(m.row.finished_at ? prettyTime(m.row.finished_at) : "进行中")}"></div></div>
+      <div class="tl-meta">${esc(durationLabel(m.end - m.start))}${m.row.exit_code !== undefined ? " · 退出码 " + esc(String(m.row.exit_code)) : ""}${facts.stop_reason ? " · " + esc(String(facts.stop_reason)) : ""}${m.failed ? " · 有机器错误" : ""}</div></div>`;
+  }).join("");
+  const repaired = marks.length > 1 || (s.human_accept && s.human_accept.decision === "reject") || s.revision > 1;
+  const back = repaired ? `<div class="tl-back">↺ <b>review → repair</b>：这一轮里有 ${marks.length} 次尝试，后一次是在前一次产物基础上返修/重跑（旧 attempt 与产物不可变）。</div>` : "";
+  return `<h3 class="pane-title">尝试时间线</h3><div class="timeline">${bars}</div>${back}
+    <div class="tl-axis"><span>${esc(prettyTime(new Date(min).toISOString()))}</span><span>${esc(prettyTime(new Date(max).toISOString()))}</span></div>`;
+}
 // 生命周期流程：把状态机画成一条链，当前节点高亮；分支状态（失败/停止未确认/返修/取消）挂在旁边。
-function flowHtml(s) {
+function flowHtml(s, data) {
   const chain = [["ready", "待规划"], ["prepared", "空会话待确认"], ["running", "执行中"],
                  ["awaiting_review", "待审查"], ["awaiting_user", "待接收"], ["accepted", "已接收"]];
   const branchLabels = {failed: "执行失败", stop_unconfirmed: "停止未确认", rework: "返修待规划", cancelled: "已取消", cancel_requested: "取消中"};
@@ -172,7 +214,7 @@ function flowHtml(s) {
     chip("验收", labelAcceptance(s.acceptance), s.acceptance === "PASS" ? "ok" : ""),
     s.review_gate ? chip("可审", s.review_gate.reviewable ? "可审" : (s.review_gate.reason || "不可审"), s.review_gate.reviewable ? "ok" : "bad") : "",
   ].filter(Boolean).join("");
-  return `<div class="flow">${nodes}</div>${hang}<div class="chips">${chips}</div>
+  return `<div class="flow">${nodes}</div>${hang}<div class="chips">${chips}</div>${timelineHtml(s, data)}
     <p class="detail-subtle">流程来自桥本地记录：规划 → 准备（shared 需客户端确认可见）→ 执行 → 回收 → 可审准入 → 只读审查（产品意见）→ 人工接收（接收 / 打回）。分支节点表示当前尝试停在哪一步外侧。</p>`;
 }
 function renderDetail(data) {
@@ -241,7 +283,7 @@ ${esc(data.native_observation.note)}</div>`) : "";
     <div class="detail-meta"><div class="meta-box"><span>状态</span><b><span class="badge ${esc(s.status)}">${esc(labelStatus(s.status))}</span></b></div><div class="meta-box"><span>验收（独立）</span><b>${esc(labelAcceptance(s.acceptance))}</b></div><div class="meta-box"><span>执行器 · 模型</span><b>${esc(task.executor)} · ${esc(labelModel(task.model))}</b></div><div class="meta-box"><span>最后更新</span><b>${esc(prettyTime(s.finished_at || s.started_at || s.created_at))}</b></div></div>
     <div class="detail-actions">${actionButtons(data)}</div>${job}${tabBar}
     <div class="pane active" data-pane="overview"><div class="detail-section"><h3>任务目标</h3><div class="detail-text">${esc(task.goal)}</div></div>${fold("允许修改", `<div class="detail-text">${esc((task.allowed_paths || []).join("\n"))}</div>`) }${effects}<p class="detail-subtle">详情为 state.current_attempt 的当前尝试，不是完整历史。</p></div>
-    <div class="pane" data-pane="flow">${flowHtml(s)}</div>
+    <div class="pane" data-pane="flow">${flowHtml(s, data)}</div>
     <div class="pane" data-pane="exec">${execPane}${activitySection}${nativeSection}${observation}${warningSection}</div>
     <div class="pane" data-pane="review">${reviewPane}</div>
     <div class="pane" data-pane="cmd">${cmdPane}</div>`;
