@@ -351,7 +351,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 if verdict not in (None, "pass", "fail", "blocked"):
                     raise ValueError("verdict 只支持 pass / fail / blocked")
                 return self._send(200, bridge.review(self.server.store, task_id, decision, audit, user,
-                                                     verdict or "blocked"))
+                                                     verdict=verdict or "blocked", reason=body.get("reason")))
             return self._error(404, "接口不存在")
         except PermissionError as error:
             return self._error(403, error)

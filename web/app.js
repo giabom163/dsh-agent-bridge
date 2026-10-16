@@ -317,7 +317,7 @@ function updateActionReady() {
   else if(c.type==="cancel") ready=$("approveCancel").checked && $("confirmPhrase").value.trim()===`CANCEL ${c.id}`;
   else if(c.type==="audit") ready=$("auditFile").files.length===1;
   else if(c.type==="accept") ready=$("auditFile").files.length===1 && $("userFile").files.length===1 && $("confirmAccept").checked;
-  else if(c.type==="reject") ready=$("auditFile").files.length===1 && $("confirmReject").checked;
+  else if(c.type==="reject") ready=$("auditFile").files.length===1 && $("confirmReject").checked && $("rejectReason").value.trim().length>0;
   $("confirmActionButton").disabled=!ready;
 }
 function openRunDialog(data, action = "run") {
@@ -344,7 +344,7 @@ function openReviewDialog(data, decision) {
   const html = `<div class="info-box">证据文件会复制到任务目录 <code>web-evidence</code> 并保留。${hint}</div>`
     + fileInput("auditFile", "只读审查证据")
     + (accept ? verdicts + fileInput("userFile", "用户真实路径证据") + `<label><input type="checkbox" id="confirmAccept">我确认所选证据对应真实客户端路径及本任务</label>` : "")
-    + (reject ? fileInput("userFile", "打回理由（可选，作为用户证据）") + `<label><input type="checkbox" id="confirmReject">我确认打回此任务的当前产物</label>` : "");
+    + (reject ? fileInput("userFile", "补充证据（可选）") + `<label>打回理由（必填；会记进 human_accept.reason，供下一次修订使用）<textarea id="rejectReason" rows="3" autocomplete="off"></textarea></label><label><input type="checkbox" id="confirmReject">我确认打回此任务的当前产物</label>` : "");
   const title = accept ? "提交验收证据" : reject ? "打回任务" : "记录只读审查";
   const eyebrow = accept ? "人工接收" : reject ? "人工打回" : "只读审查";
   const confirmText = accept ? "审查并接收" : reject ? "确认打回" : "提交审查";
@@ -366,6 +366,7 @@ $("confirmActionButton").addEventListener("click", async () => {
       const body={decision:c.type,audit_evidence:await evidenceFile("auditFile")};
       if(c.type==="accept")body.user_evidence=await evidenceFile("userFile");
       if(c.type==="reject" && $("userFile").files.length===1)body.user_evidence=await evidenceFile("userFile");
+      if(c.type==="reject")body.reason=$("rejectReason").value.trim();
       if(c.type==="audit"){const picked=document.querySelector('input[name="verdict"]:checked');body.verdict=picked?picked.value:"blocked";}
       data=await api(`/api/tasks/${c.id}/review`,{method:"POST",body:JSON.stringify(body)});
     }

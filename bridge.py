@@ -931,7 +931,7 @@ def review_inputs(store, items):
     return checked
 
 
-def review(store, task_id, decision, audit, user, verdict="blocked", review_input=None):
+def review(store, task_id, decision, audit, user, verdict="blocked", review_input=None, reason=None):
     directory = task_dir(store, task_id)
     with writer(store):
         task, state = load_task(directory)
@@ -977,8 +977,11 @@ def review(store, task_id, decision, audit, user, verdict="blocked", review_inpu
                 raise ValueError("只有待审查／待接收的任务可以打回（当前 %s）" % state["status"])
             if "audit" not in evidence:
                 raise ValueError("打回也需要只读审计证据")
+            if not isinstance(reason, str) or not reason.strip():
+                raise ValueError("打回必须填写理由（会作为反馈记录，供下一次修订使用）")
             state.update(status="rework", acceptance="BLOCKED")
-            state["human_accept"] = {"decision": "reject", "evidence": evidence, "at": now()}
+            state["human_accept"] = {"decision": "reject", "reason": reason.strip()[:2000],
+                                     "evidence": evidence, "at": now()}
         else:
             if "audit" not in evidence:
                 raise ValueError("审计阶段需要证据文件")
@@ -1139,6 +1142,7 @@ def main():
                            help="只读审查（audit）的产品意见；accept 不使用本字段")
             p.add_argument("--review-input", type=Path,
                            help="可选：只读复审引用的外部产物数组（JSON，分账契约 §3.3）")
+            p.add_argument("--reason", help="打回理由；--decision reject 时必填，写入 human_accept.reason")
         if name == "revise":
             p.add_argument("contract", type=Path)
     args = parser.parse_args()
@@ -1154,7 +1158,7 @@ def main():
     elif args.command == "status": result = load_task(task_dir(store, args.task_id))[1]
     elif args.command in ("prepare", "run"): result = run(store, args.task_id, config, args.plan_sha256, args.approve_start, args.ack_unmetered, args.command == "prepare", args.confirm_visible)
     elif args.command == "cancel": result = cancel(store, args.task_id, args.attempt_id, args.approve_cancel)
-    elif args.command == "review": result = review(store, args.task_id, args.decision, args.audit_evidence, args.user_evidence, args.verdict, args.review_input)
+    elif args.command == "review": result = review(store, args.task_id, args.decision, args.audit_evidence, args.user_evidence, args.verdict, args.review_input, args.reason)
     elif args.command == "backfill":
         if args.all_tasks:
             tasks_dir = store / "tasks"
