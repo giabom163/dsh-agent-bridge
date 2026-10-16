@@ -27,6 +27,11 @@ ANCHOR = re.compile(r"(?P<path>[^:]+):(?P<lines>\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*)"
 # 无效；仓库自身路径长短不影响该阈值。留出余量，超安全阈值就改放短根，超硬上限直接给桥自己的错误。
 WORKTREE_PATH_SAFE = 200
 WORKTREE_PATH_LIMIT = 215
+# 收尾确认等待上限（秒）：本机实测 session.get 单次往返约 0.08 秒，已停止会话立即返回
+# outcome；此值只用于容忍收尾落盘延迟，不是墙钟超时。超时后最多多等这么久来拿"已停稳"结论。
+STOP_CONFIRM_WAIT_SECONDS = 30
+# 执行期健康探针节拍（秒）。实测 session.get 单次往返约 0.08 秒，10 秒一次可忽略开销。
+HEALTH_PROBE_INTERVAL = 10.0
 # 父会话若导出这些变量，git 会指向错误仓库或同样报错；调用 git 前统一剥离。
 GIT_ENV_STRIP = frozenset(("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
                            "GIT_COMMON_DIR", "GIT_ALTERNATE_OBJECT_DIRECTORIES"))
@@ -443,6 +448,82 @@ def resume_shared(store, directory, task, state, config, approved, expected, con
                            digest((worktree / ".git").read_bytes()), before, command, input_bytes)
 
 
+def native_cost(info):
+    """从原生会话回读里取真实用量。本机实测（OpenCode 2.0.20）session.get 返回
+    cost 与 tokens{input,output,reasoning,cache{read,write}}，故不再以 None 表示"未知"。
+    取不到时返回 None，并由调用方注明未取到，而不是补零。"""
+    if not isinstance(info, dict):
+        return None
+    cost = info.get("cost")
+    tokens = info.get("tokens")
+    if cost is None and not tokens:
+        return None
+    return {"cost": cost, "tokens": tokens,
+            "note": "原生服务回读的真实计费与用量；跨执行器语义未逐一核实，不据此推算请求数"}
+
+
+def probe_health(attempt_dir, config, native, session_id, worktree, run_started, last_stream_at):
+    """执行期只读健康探针：只回读、只记录，不改判定、不发模型。
+    本机实测 session.get 单次往返约 0.08 秒，故按 10 秒节奏采样开销可忽略。
+    静默或停滞只写入 health.json 供审查者判断，本版本不在执行中触发中断。"""
+    try:
+        info = adapters.native_api(config, native["server"], "session.get", session_id=session_id, cwd=worktree)
+    except Exception:
+        return  # 探针失败不得影响主循环；下一次采样再试
+    time_info = (info.get("time") or {}) if isinstance(info, dict) else {}
+    idle = time_info.get("idle")
+    updated = time_info.get("updated")
+    # stall 用服务端时间字段算，不用本地墙钟，避免把本地调度延迟算成模型停滞。
+    stall = None
+    if isinstance(idle, (int, float)) and isinstance(updated, (int, float)) and idle >= updated:
+        stall = (idle - updated) / 1000.0
+    atomic(attempt_dir / "health.json", {
+        "at": now(),
+        "outcome": info.get("outcome") if isinstance(info, dict) else None,
+        "token_usage": native_cost(info),
+        "stall_seconds": stall,
+        "silence_seconds": round(time.monotonic() - last_stream_at, 1),
+        "elapsed_seconds": round(time.monotonic() - run_started, 1),
+        "note": "只读回读；不代表模型已停止或未计费。stall 由服务端时间字段算出，非本地墙钟"})
+
+
+def interrupt_and_confirm(attempt_dir, config, native, session_id, worktree):
+    """中断原生会话并有界确认停止。返回 (stop_outcome, info)。
+
+    本机实测：session.interrupt 幂等（对已完成会话重复调用不报错、不改动会话数据），
+    停止后 outcome 立即非空，故确认循环按 1 秒节奏、上限 STOP_CONFIRM_WAIT_SECONDS。
+    单次采样必然误判——历史 b-flash-r5 在中断回执到手 0.25 秒后采样不到 outcome，
+    被记成 stop_unconfirmed；事后官方回读为 interrupted。"""
+    record = {"requested_at": now()}
+    try:
+        receipt = adapters.native_api(config, native["server"], "session.interrupt",
+                                      session_id=session_id, cwd=worktree)
+        record["receipt"] = receipt
+    except Exception as error:
+        record["interrupt_error"] = scrub(str(error))
+    stop_outcome = None
+    info = None
+    deadline = time.monotonic() + STOP_CONFIRM_WAIT_SECONDS
+    while True:
+        try:
+            info = adapters.native_api(config, native["server"], "session.get",
+                                       session_id=session_id, cwd=worktree)
+        except Exception as error:
+            record["confirm_error"] = scrub(str(error))
+            break
+        outcome = info.get("outcome") if isinstance(info, dict) else None
+        if isinstance(outcome, str) and outcome:
+            stop_outcome = outcome
+            break
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(1.0)
+    record.update(confirmed=stop_outcome is not None, outcome=stop_outcome,
+                  waited_seconds=round(STOP_CONFIRM_WAIT_SECONDS - max(0.0, deadline - time.monotonic()), 1))
+    atomic(attempt_dir / "interrupt.json", record)
+    return stop_outcome, info
+
+
 def execute_attempt(directory, task, state, config, expected, attempt_dir, attempt, worktree,
                     git_marker, before, command, input_bytes):
         attempt_id = attempt["attempt_id"]
@@ -462,6 +543,9 @@ def execute_attempt(directory, task, state, config, expected, attempt_dir, attem
         stop_confirmed = None
         started_ms = int(time.time() * 1000)
         interrupted = False
+        final_usage = None      # 原生回读到的真实计费/用量；取不到保持 None，不补零
+        final_outcome = None    # 中断确认得到的停止结论（succeeded/interrupted/failed）
+        final_info = None       # 中断确认时顺带回读到的会话快照，收尾复用，避免二次等待
         streams = queue.Queue(maxsize=256)
         def pump(stream, name):
             try:
@@ -506,6 +590,10 @@ def execute_attempt(directory, task, state, config, expected, attempt_dir, attem
             threading.Thread(target=feed_input, daemon=True).start()
             closed = set()
             stopped_at = None
+            # 健康探针与静默计时：探针只回读不改判定；silence 用于审查者判断是否值得提前止损。
+            run_started = time.monotonic()
+            last_probe = run_started
+            last_stream_at = run_started
             handles = {name: (attempt_dir / (name + ".log")).open("w", encoding="utf-8") for name in ("stdout", "stderr")}
             try:
                 while len(closed) < 2:
@@ -518,21 +606,23 @@ def execute_attempt(directory, task, state, config, expected, attempt_dir, attem
                         stopped_at = stopped_at or time.monotonic()
                         if native and not interrupted:
                             interrupted = True
-                            try:
-                                receipt = adapters.native_api(config, native["server"], "session.interrupt",
-                                                              session_id=session_id, cwd=worktree)
-                                atomic(attempt_dir / "interrupt.json", {"time": now(), "receipt": receipt})
-                            except Exception as error:
-                                native_errors.append({"stage": "interrupt", "message": scrub(str(error))})
+                            # 主循环停在这里直到确认完成（上限 STOP_CONFIRM_WAIT_SECONDS）：
+                            # 让中断回执与停止结论都落盘，收尾就不用再等第二次。
+                            final_outcome, final_info = interrupt_and_confirm(
+                                attempt_dir, config, native, session_id, worktree)
+                            if final_outcome is None:
+                                native_errors.append({"stage": "interrupt",
+                                                      "message": "已发出中断但在等待上限内未取到停止结论；需只读核查原生会话"})
                         tree.close()
                         if process.poll() is None:
                             process.wait(timeout=10)
-                        if time.monotonic() - stopped_at > 10:
-                            native_errors.append({"stage": "streams", "message": "进程管道未及时关闭；日志可能不完整"})
-                            break
+                        break
                     # 完成主进程也关闭私有子进程，避免持有管道导致永不返回。
                     if process.poll() is not None:
                         tree.close()
+                    if native and time.monotonic() - last_probe >= HEALTH_PROBE_INTERVAL:
+                        last_probe = time.monotonic()
+                        probe_health(attempt_dir, config, native, session_id, worktree, run_started, last_stream_at)
                     try:
                         name, line = streams.get(timeout=0.2)
                     except queue.Empty:
@@ -544,6 +634,7 @@ def execute_attempt(directory, task, state, config, expected, attempt_dir, attem
                         closed.add(name)
                         continue
                     text = scrub(line.decode("utf-8", "replace"))
+                    last_stream_at = time.monotonic()
                     parsed = None
                     if name == "stdout":
                         try:
@@ -591,12 +682,10 @@ def execute_attempt(directory, task, state, config, expected, attempt_dir, attem
         finally:
             if native and stop_reason and process and not interrupted:
                 interrupted = True
-                try:
-                    receipt = adapters.native_api(config, native["server"], "session.interrupt",
-                                                  session_id=session_id, cwd=worktree)
-                    atomic(attempt_dir / "interrupt.json", {"time": now(), "receipt": receipt})
-                except Exception as error:
-                    native_errors.append({"stage": "interrupt", "message": scrub(str(error))})
+                final_outcome, final_info = interrupt_and_confirm(attempt_dir, config, native, session_id, worktree)
+                if final_outcome is None:
+                    native_errors.append({"stage": "interrupt",
+                                          "message": "已发出中断但在等待上限内未取到停止结论；需只读核查原生会话"})
             if tree:
                 tree.close()
             if process and tree and process.poll() is None:
@@ -608,19 +697,47 @@ def execute_attempt(directory, task, state, config, expected, attempt_dir, attem
                 exit_code = process.returncode
             if native:
                 # 即使观察进程结束，也要向原生服务回读；不将断开观察等同于停止任务。
-                try:
-                    info = adapters.native_api(config, native["server"], "session.get", session_id=session_id, cwd=worktree)
-                    idle = info.get("time", {}).get("idle", 0)
-                    stop_confirmed = isinstance(idle, (int, float)) and idle >= started_ms
-                    native.update(session=info, stop_confirmed=stop_confirmed, observed_at=now())
+                #
+                # 本机实测（2026-10-16，OpenCode 2.0.20，50 个真实会话）：
+                #   session.get 的 time.idle 不是在会话停止时立即落盘，而是**按契约超时窗延迟出现**。
+                #   四个被中断的会话，idle − updated 分别等于 170.163 / 180.077 / 300.453 / 900.275 秒，
+                #   与各自契约的 timeout_seconds（170/180/300/900）逐项吻合。
+                # 因此旧判据 idle >= started_ms 在超时后必然为假：即使会话早已按中断停止，
+                # 也会被记成 stop_unconfirmed，导致产物按规则不得重派。
+                # 停止的**可用判据是 outcome**：实测已停止会话立即返回 interrupted/succeeded/failed。
+                # 但收尾落 outcome 需要一点时间，故改为有界确认循环，而不是单次采样。
+                stop_outcome = final_outcome    # 主循环若已中断并确认，直接沿用其结论
+                info = final_info               # 主循环已回读到快照时收尾不再二次等待
+                confirm_deadline = time.monotonic() + STOP_CONFIRM_WAIT_SECONDS
+                while info is None and stop_outcome is None:
+                    try:
+                        info = adapters.native_api(config, native["server"], "session.get", session_id=session_id, cwd=worktree)
+                    except Exception as error:
+                        native_errors.append({"stage": "native_status", "message": scrub(str(error))})
+                        break
+                    outcome = info.get("outcome") if isinstance(info, dict) else None
+                    if isinstance(outcome, str) and outcome:
+                        stop_outcome = outcome
+                        break
+                    if time.monotonic() >= confirm_deadline:
+                        break
+                    time.sleep(1.0)
+                if info is None:
+                    # 一次都没读上：必须留证，不能静默滑到"未确认"。
+                    native_errors.append({"stage": "native_status",
+                                          "message": "收尾未能回读原生会话；停止状态未知"})
+                idle = (info.get("time") or {}).get("idle", 0) if isinstance(info, dict) else 0
+                idle_settled = isinstance(idle, (int, float)) and idle >= started_ms
+                stop_confirmed = stop_outcome is not None
+                final_usage = native_cost(info)
+                if info is not None:
+                    native.update(session=info, stop_confirmed=stop_confirmed, stop_outcome=stop_outcome,
+                                  idle_settled=idle_settled, observed_at=now())
                     atomic(native_path, native)
-                    if not stop_confirmed:
-                        native_errors.append({"stage": "native_status", "message": "未确认原生会话已停稳；禁止重派或接收"})
-                    elif info.get("outcome") != "succeeded" and not stop_reason:
-                        native_errors.append({"stage": "native_outcome", "message": str(info.get("outcome"))})
-                except Exception as error:
-                    stop_confirmed = False
-                    native_errors.append({"stage": "native_status", "message": scrub(str(error))})
+                if not stop_confirmed:
+                    native_errors.append({"stage": "native_status", "message": "未确认原生会话已停稳；禁止重派或接收"})
+                elif stop_outcome != "succeeded" and not stop_reason:
+                    native_errors.append({"stage": "native_outcome", "message": str(stop_outcome)})
         # 失败同样留证；不自动修复、不清理 worktree。
         try:
             if digest((worktree / ".git").read_bytes()) != git_marker:
@@ -649,6 +766,9 @@ def execute_attempt(directory, task, state, config, expected, attempt_dir, attem
                   "base_commit": approved["base_commit"],
                   "after_snapshot_sha256": digest(json_bytes(after)) if 'after' in locals() else None,
                   "upstream_requests": None, "usage": native.get("session", {}).get("tokens") if native else None,
+                  # 本机实测 session.get 返回真实 cost 与 tokens，故单列一项；取不到为 None 而不是零。
+                  "native_cost": final_usage,
+                  "stop_outcome": final_outcome,
                   "usage_note": "保留原生 JSON 日志；未核实跨执行器 usage 语义，不估算次数或费用"}
         if status == "stop_unconfirmed":
             result["acceptance"] = "BLOCKED"
