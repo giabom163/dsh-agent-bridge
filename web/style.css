@@ -35,3 +35,17 @@
 .cmd-picker{display:grid;grid-template-columns:minmax(120px,170px) minmax(0,1fr) auto;gap:8px;align-items:center;margin:8px 0}
 .cmd-picker select{height:32px;border:1px solid var(--line);border-radius:8px;background:#fff;padding:0 8px}
 .cmd-picker code{font:12px 'DM Mono',monospace;color:#2c3a35;overflow-wrap:anywhere;white-space:pre-wrap}
+
+/* 生命周期流程图 + 产品意见单选 + 指标卡选中态 */
+.metric[data-filter]{cursor:pointer}
+.metric[data-filter].active{border-color:#7fbf9c;box-shadow:0 0 0 2px #dff0e6 inset}
+.flow{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:8px 0 4px}
+.flow .node{border:1px solid var(--line);border-radius:9px;padding:6px 10px;background:#fbfdfc;font-size:12px;color:#66716c}
+.flow .node.done{border-color:#b7ddc6;background:#f1f9f4;color:#1f6b4c}
+.flow .node.current{border-color:#226b53;background:#226b53;color:#fff;font-weight:600}
+.flow .node.bad{border-color:#e8c1be;background:#fdf3f2;color:#9d3b34}
+.flow .arrow{font-style:normal;color:#b6c0bb;padding:0 2px}
+.flow-hang{display:flex;align-items:center;gap:6px;margin:2px 0 8px}
+.verdict{border:1px solid var(--line);border-radius:9px;margin:8px 0;padding:8px 10px;display:flex;gap:14px;align-items:center}
+.verdict legend{font-size:11px;color:#8b968f;padding:0 4px}
+.verdict label{font-size:13px;display:inline-flex;gap:5px;align-items:center}

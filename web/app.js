@@ -1,5 +1,5 @@
 const $ = (id) => document.getElementById(id);
-const state = { tasks: [], selected: null, plans: new Map(), action: null, editTask: null, connected: true, hasLoadedTasks: false, lastSuccessAt: null, graph: null };
+const state = { tasks: [], selected: null, plans: new Map(), action: null, editTask: null, connected: true, hasLoadedTasks: false, lastSuccessAt: null, graph: null, filter: null };
 
 function esc(value) {
   return String(value ?? "").replace(/[&<>"']/g, (ch) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[ch]));
@@ -85,25 +85,42 @@ function initGraph() {
     return null;
   }
 }
+function metricCard(key, title, value, sub, icon) {
+  return `<article class="metric ${state.filter === key ? "active" : ""}" data-filter="${key}" role="button" tabindex="0" title="点击筛选"><div class="metric-top"><span>${title}</span><span class="metric-icon">${icon}</span></div><div class="metric-value">${value}</div><div class="metric-sub">${sub}</div></article>`;
+}
 function renderMetrics() {
   if (!state.hasLoadedTasks) {
-    // 从未成功读取任务：计数未知，显示“—”而不是 0，避免把未知当成空。
-    const unknown = [["任务总数","—","尚未成功读取","◫"],["正在执行","—","尚未成功读取","↗"],["等待审查","—","尚未成功读取","◇"],["验收阻塞","—","尚未成功读取","! "]];
-    $("metrics").innerHTML = unknown.map(([title,value,sub,icon]) => `<article class="metric"><div class="metric-top"><span>${title}</span><span class="metric-icon">${icon}</span></div><div class="metric-value">${value}</div><div class="metric-sub">${sub}</div></article>`).join("");
+    // 从未成功读取任务：计数未知，显示"—"而不是 0，避免把未知当成空。
+    const unknown = [["all","任务总数","—","尚未成功读取","◫"],["review","待我审查","—","尚未成功读取","◇"],["reviewable","可审产物","—","尚未成功读取","✓"],["failed","执行失败","—","尚未成功读取","! "]];
+    $("metrics").innerHTML = unknown.map(([k,t,v,s,i]) => metricCard(k,t,v,s,i)).join("");
     return;
   }
-  const counts = {all:state.tasks.length,active:0,review:0,blocked:0};
+  const counts = { all: state.tasks.length, review: 0, reviewable: 0, failed: 0 };
   for (const row of state.tasks) {
-    if (["running","cancel_requested"].includes(row.state.status)) counts.active++;
-    if (["awaiting_review","awaiting_user"].includes(row.state.status)) counts.review++;
-    if (row.state.acceptance === "BLOCKED") counts.blocked++;
+    const st = row.state.status, facts = row.state.execution_facts || {};
+    if (["awaiting_review", "awaiting_user"].includes(st)) counts.review++;
+    if (row.state.reviewable === true) counts.reviewable++;
+    if (["failed", "stop_unconfirmed", "cancelled"].includes(st) || facts.exit_code > 0
+        || (facts.violations || []).length || (facts.missing_artifacts || []).length
+        || (facts.native_error_count || 0) > 0) counts.failed++;
   }
-  const metrics = [["任务总数",counts.all,"本地任务记录","◫"],["正在执行",counts.active,"桥持有的执行任务","↗"],["等待审查",counts.review,"需要人工查看","◇"],["验收阻塞",counts.blocked,"证据不足或待操作","! "]];
-  $("metrics").innerHTML = metrics.map(([title,value,sub,icon]) => `<article class="metric"><div class="metric-top"><span>${title}</span><span class="metric-icon">${icon}</span></div><div class="metric-value">${value}</div><div class="metric-sub">${sub}</div></article>`).join("");
+  const metrics = [["all","任务总数",counts.all,"本地任务记录","◫"],["review","待我审查",counts.review,"待审查 + 待接收","◇"],
+                   ["reviewable","可审产物",counts.reviewable,"review_gate 通过","✓"],["failed","执行失败",counts.failed,"越界 / 缺产物 / 非零退出","! "]];
+  $("metrics").innerHTML = metrics.map(([k,t,v,s,i]) => metricCard(k,t,v,s,i)).join("");
+  document.querySelectorAll(".metric[data-filter]").forEach(el => el.addEventListener("click", () => {
+    state.filter = (state.filter === el.dataset.filter && el.dataset.filter !== "all") ? null : el.dataset.filter;
+    renderMetrics(); renderRows();
+  }));
 }
 function renderRows() {
   const query = $("searchInput").value.trim().toLowerCase();
-  const rows = state.tasks.filter(x => `${x.task_id} ${x.task.goal}`.toLowerCase().includes(query));
+  const rows = state.tasks.filter(x => {
+    const st = x.state.status;
+    if (state.filter === "review") return ["awaiting_review", "awaiting_user"].includes(st);
+    if (state.filter === "reviewable") return x.state.reviewable === true;
+    if (state.filter === "failed") return ["failed", "stop_unconfirmed", "cancelled"].includes(st);
+    return true;
+  }).filter(x => `${x.task_id} ${x.task.goal}`.toLowerCase().includes(query));
   // 表格空态与图、文本列表遵循同一判别：从未成功加载 ≠ 成功加载且确为空。
   const unknown = !state.hasLoadedTasks;
   $("emptyState").classList.toggle("visible", state.tasks.length === 0);
@@ -121,11 +138,12 @@ function actionButtons(data) {
   const prepareButton = shared && ["ready","rework"].includes(s) && state.plans.has(id) ? `<button class="primary-button small-button" data-action="prepare">创建可见空会话</button>` : "";
   const runButton = ["ready","rework","prepared"].includes(s) && (!shared || s === "prepared") && state.plans.has(id) ? `<button class="primary-button small-button" data-action="run">发送提示词执行</button>` : "";
   const cancelButton = s === "running" && data.state.current_attempt ? `<button class="danger-button small-button" data-action="cancel">请求取消</button>` : "";
-  const auditButton = s === "awaiting_review" ? `<button class="primary-button small-button" data-action="audit">提交只读审查</button>` : "";
+  const auditButton = s === "awaiting_review" ? `<button class="primary-button small-button" data-action="audit">只读审查（通过 / 不通过）</button>` : "";
   const acceptButton = s === "awaiting_user" ? `<button class="primary-button small-button" data-action="accept">附证据并接收</button>` : "";
+  const rejectButton = ["awaiting_review", "awaiting_user"].includes(s) ? `<button class="danger-button small-button" data-action="reject">打回返修</button>` : "";
   const reviseButton = !["running","prepared","stop_unconfirmed","accepted"].includes(s) ? `<button class="secondary-button small-button" data-action="revise">修订契约</button>` : "";
   const nativeButton = data.native ? `<button class="secondary-button small-button" data-action="native-status">回读原生状态</button>` : "";
-  return planButton + prepareButton + runButton + nativeButton + cancelButton + auditButton + acceptButton + reviseButton;
+  return planButton + prepareButton + runButton + nativeButton + cancelButton + auditButton + acceptButton + rejectButton + reviseButton;
 }
 async function selectTask(id) {
   state.selected = id; renderRows();
@@ -133,6 +151,29 @@ async function selectTask(id) {
   try {
     const data = await api(`/api/tasks/${encodeURIComponent(id)}`); renderDetail(data);
   } catch (error) { toast(error.message, true); }
+}
+// 生命周期流程：把状态机画成一条链，当前节点高亮；分支状态（失败/停止未确认/返修/取消）挂在旁边。
+function flowHtml(s) {
+  const chain = [["ready", "待规划"], ["prepared", "空会话待确认"], ["running", "执行中"],
+                 ["awaiting_review", "待审查"], ["awaiting_user", "待接收"], ["accepted", "已接收"]];
+  const branchLabels = {failed: "执行失败", stop_unconfirmed: "停止未确认", rework: "返修待规划", cancelled: "已取消", cancel_requested: "取消中"};
+  const branch = branchLabels[s.status] || null;
+  const index = chain.findIndex(([key]) => key === s.status);
+  const nodes = chain.map(([, label], i) => {
+    const cls = i === index ? "node current" : (index >= 0 && i < index) ? "node done" : "node";
+    return `<div class="${cls}"><span>${esc(label)}</span></div>`;
+  }).join('<i class="arrow">→</i>');
+  const hang = branch ? `<div class="flow-hang"><i class="arrow">↳</i><div class="node bad"><span>${esc(branch)}</span></div></div>` : "";
+  const chips = [
+    chip("尝试", s.current_attempt ? s.current_attempt.slice(-8) : "无"),
+    chip("修订", "r" + String(s.revision)),
+    chip("开始", s.started_at ? prettyTime(s.started_at) : "未开始"),
+    chip("结束", s.finished_at ? prettyTime(s.finished_at) : "未结束"),
+    chip("验收", labelAcceptance(s.acceptance), s.acceptance === "PASS" ? "ok" : ""),
+    s.review_gate ? chip("可审", s.review_gate.reviewable ? "可审" : (s.review_gate.reason || "不可审"), s.review_gate.reviewable ? "ok" : "bad") : "",
+  ].filter(Boolean).join("");
+  return `<div class="flow">${nodes}</div>${hang}<div class="chips">${chips}</div>
+    <p class="detail-subtle">流程来自桥本地记录：规划 → 准备（shared 需客户端确认可见）→ 执行 → 回收 → 可审准入 → 只读审查（产品意见）→ 人工接收（接收 / 打回）。分支节点表示当前尝试停在哪一步外侧。</p>`;
 }
 function renderDetail(data) {
   const task = data.task, s = data.state, plan = state.plans.get(task.task_id);
@@ -194,12 +235,13 @@ function renderDetail(data) {
 原生 idle 时间：${esc(data.native_observation.session?.time?.idle || "尚无记录")}
 ${esc(data.native_observation.note)}</div>`) : "";
   const job = data.job?.running ? `<div class="chips">${chip("桥任务", "执行器正在运行，刷新读取最新状态", "warn")}</div>` : data.job?.error ? `<div class="chips">${chip("操作失败", data.job.error, "bad")}</div>` : "";
-  const tabs = [["overview", "概览"], ["exec", "执行"], ["review", "审查"], ["cmd", "命令"]];
+  const tabs = [["overview", "概览"], ["flow", "流程"], ["exec", "执行"], ["review", "审查"], ["cmd", "命令"]];
   const tabBar = `<div class="tabs">${tabs.map(([key, label], index) => `<button class="tab ${index === 0 ? "active" : ""}" data-tab="${key}">${label}</button>`).join("")}</div>`;
   $("detailPanel").innerHTML = `<div class="detail-head"><div><h2>${esc(task.title || task.goal)}</h2><p>${esc(task.task_id)} · revision ${esc(s.revision)}</p></div><button class="icon-button detail-close" id="detailClose" title="关闭">×</button></div>
     <div class="detail-meta"><div class="meta-box"><span>状态</span><b><span class="badge ${esc(s.status)}">${esc(labelStatus(s.status))}</span></b></div><div class="meta-box"><span>验收（独立）</span><b>${esc(labelAcceptance(s.acceptance))}</b></div><div class="meta-box"><span>执行器 · 模型</span><b>${esc(task.executor)} · ${esc(labelModel(task.model))}</b></div><div class="meta-box"><span>最后更新</span><b>${esc(prettyTime(s.finished_at || s.started_at || s.created_at))}</b></div></div>
     <div class="detail-actions">${actionButtons(data)}</div>${job}${tabBar}
     <div class="pane active" data-pane="overview"><div class="detail-section"><h3>任务目标</h3><div class="detail-text">${esc(task.goal)}</div></div>${fold("允许修改", `<div class="detail-text">${esc((task.allowed_paths || []).join("\n"))}</div>`) }${effects}<p class="detail-subtle">详情为 state.current_attempt 的当前尝试，不是完整历史。</p></div>
+    <div class="pane" data-pane="flow">${flowHtml(s)}</div>
     <div class="pane" data-pane="exec">${execPane}${activitySection}${nativeSection}${observation}${warningSection}</div>
     <div class="pane" data-pane="review">${reviewPane}</div>
     <div class="pane" data-pane="cmd">${cmdPane}</div>`;
@@ -241,6 +283,7 @@ async function handleAction(action, data) {
   if (action === "cancel") openCancelDialog(data);
   if (action === "audit") openReviewDialog(data, "audit");
   if (action === "accept") openReviewDialog(data, "accept");
+  if (action === "reject") openReviewDialog(data, "reject");
 }
 function openTaskDialog(task = null) {
   state.editTask = task;
@@ -274,6 +317,7 @@ function updateActionReady() {
   else if(c.type==="cancel") ready=$("approveCancel").checked && $("confirmPhrase").value.trim()===`CANCEL ${c.id}`;
   else if(c.type==="audit") ready=$("auditFile").files.length===1;
   else if(c.type==="accept") ready=$("auditFile").files.length===1 && $("userFile").files.length===1 && $("confirmAccept").checked;
+  else if(c.type==="reject") ready=$("auditFile").files.length===1 && $("confirmReject").checked;
   $("confirmActionButton").disabled=!ready;
 }
 function openRunDialog(data, action = "run") {
@@ -288,9 +332,23 @@ function openCancelDialog(data) {
   openAction("中断此任务","取消批准",`<div class="warning-box">共享模式会向此会话发送原生 interrupt，并结束桥的观察进程；不会关闭 OpenCode 服务。私有模式结束该任务进程树。必须回读原生状态确认停稳；现场保留。</div><div class="info-box"><strong>任务：</strong>${esc(id)}<br><strong>当前 attempt：</strong>${esc(attempt)}</div><label><input type="checkbox" id="approveCancel">我批准中断此 attempt</label><label>输入 <strong>CANCEL ${esc(id)}</strong> 确认<input type="text" id="confirmPhrase" autocomplete="off"></label>`,"请求取消",{type:"cancel",id,attempt});
 }
 function openReviewDialog(data, decision) {
-  const accept=decision==="accept";
-  const html=`<div class="info-box">证据文件会复制到任务目录 <code>web-evidence</code> 并保留。${accept?"接收要求只读审查证据和用户真实路径证据同时提供。":"此步骤只记录只读审查；验收仍为 BLOCKED，之后需要真实用户路径证据。"}</div><label>只读审查证据<input type="file" id="auditFile" accept=".md,.txt,.json,.log,.png,.jpg,.jpeg"></label>${accept?`<label>用户真实路径证据<input type="file" id="userFile" accept=".md,.txt,.json,.log,.png,.jpg,.jpeg"></label><label><input type="checkbox" id="confirmAccept">我确认所选证据对应真实客户端路径及本任务</label>`:""}`;
-  openAction(accept?"提交验收证据":"记录只读审查",accept?"人工接收":"只读审查",html,accept?"审查并接收":"提交审查",{type:decision,id:data.task.task_id});
+  const accept = decision === "accept", reject = decision === "reject";
+  const fileInput = (id, label) => `<label>${label}<input type="file" id="${id}" accept=".md,.txt,.json,.log,.png,.jpg,.jpeg"></label>`;
+  const verdicts = `<fieldset class="verdict"><legend>产品意见</legend>
+    <label><input type="radio" name="verdict" value="pass" checked>通过</label>
+    <label><input type="radio" name="verdict" value="fail">不通过</label>
+    <label><input type="radio" name="verdict" value="blocked">阻塞</label></fieldset>`;
+  const hint = accept ? "接收要求只读审查证据和用户真实路径证据同时提供；机器门（退出码 / 越界 / 缺产物 / 原生错误）一字不放宽。"
+    : reject ? "打回会把任务退回 rework（可改契约后重跑），不改历史产物、不自动重跑、不删除现场。至少附只读审计证据。"
+    : "此处只记录只读审查与产品意见；验收仍是 BLOCKED，之后还需要你的真实路径证据。";
+  const html = `<div class="info-box">证据文件会复制到任务目录 <code>web-evidence</code> 并保留。${hint}</div>`
+    + fileInput("auditFile", "只读审查证据")
+    + (accept ? verdicts + fileInput("userFile", "用户真实路径证据") + `<label><input type="checkbox" id="confirmAccept">我确认所选证据对应真实客户端路径及本任务</label>` : "")
+    + (reject ? fileInput("userFile", "打回理由（可选，作为用户证据）") + `<label><input type="checkbox" id="confirmReject">我确认打回此任务的当前产物</label>` : "");
+  const title = accept ? "提交验收证据" : reject ? "打回任务" : "记录只读审查";
+  const eyebrow = accept ? "人工接收" : reject ? "人工打回" : "只读审查";
+  const confirmText = accept ? "审查并接收" : reject ? "确认打回" : "提交审查";
+  openAction(title, eyebrow, html, confirmText, {type: decision, id: data.task.task_id});
 }
 async function evidenceFile(inputId) {
   const file=$(inputId).files[0]; if(!file)throw new Error("请选择证据文件");
@@ -307,9 +365,11 @@ $("confirmActionButton").addEventListener("click", async () => {
     else {
       const body={decision:c.type,audit_evidence:await evidenceFile("auditFile")};
       if(c.type==="accept")body.user_evidence=await evidenceFile("userFile");
+      if(c.type==="reject" && $("userFile").files.length===1)body.user_evidence=await evidenceFile("userFile");
+      if(c.type==="audit"){const picked=document.querySelector('input[name="verdict"]:checked');body.verdict=picked?picked.value:"blocked";}
       data=await api(`/api/tasks/${c.id}/review`,{method:"POST",body:JSON.stringify(body)});
     }
-    $("actionDialog").close(); toast(c.type==="prepare"?"正在创建空会话；不会发送提示词。":c.type==="run"?"提示词执行已提交；请查看原生会话。":c.type==="cancel"?"取消请求已记录；请核对停止状态。":"审查记录已提交。 ");
+    $("actionDialog").close(); toast(c.type==="prepare"?"正在创建空会话；不会发送提示词。":c.type==="run"?"提示词执行已提交；请查看原生会话。":c.type==="cancel"?"取消请求已记录；请核对停止状态。":c.type==="reject"?"打回已记录：任务回到 rework，可改契约后重跑。":"审查记录已提交。 ");
     if(c.type==="run")await new Promise(resolve=>setTimeout(resolve,350)); await refresh();
   } catch(error) { $("actionError").textContent=error.message; $("confirmActionButton").disabled=false; }
 });

@@ -971,9 +971,19 @@ def review(store, task_id, decision, audit, user, verdict="blocked", review_inpu
             state.update(status="accepted", acceptance="PASS")
             # D 轴：人工接收。acceptance 只表达机器执行安全性，不再承载产品意见。
             state["human_accept"] = {"decision": "accept", "evidence": evidence, "at": now()}
+        elif decision == "reject":
+            # D 轴：人工打回。回到可修订状态（rework），不写 PASS、不改历史产物、不自动重跑。
+            if state["status"] not in ("awaiting_review", "awaiting_user"):
+                raise ValueError("只有待审查／待接收的任务可以打回（当前 %s）" % state["status"])
+            if "audit" not in evidence:
+                raise ValueError("打回也需要只读审计证据")
+            state.update(status="rework", acceptance="BLOCKED")
+            state["human_accept"] = {"decision": "reject", "evidence": evidence, "at": now()}
         else:
             if "audit" not in evidence:
                 raise ValueError("审计阶段需要证据文件")
+            if state["status"] == "accepted":
+                raise ValueError("已接收的任务不能重新打开只读审查；如需复审请先打回或修订")
             if verdict not in ("pass", "fail", "blocked"):
                 raise ValueError("verdict 只支持 pass / fail / blocked")
             state.update(status="awaiting_user", acceptance="BLOCKED")
@@ -989,7 +999,7 @@ def review(store, task_id, decision, audit, user, verdict="blocked", review_inpu
         state["review_evidence"] = evidence
         atomic(directory / "state.json", state)
         event(directory, "human_review", decision=decision,
-              verdict=None if decision == "accept" else verdict,
+              verdict=verdict if decision == "audit" else None,
               evidence=evidence, reviewable=gate["reviewable"], review_gate_reason=gate["reason"])
     return state
 
@@ -1122,7 +1132,7 @@ def main():
             p.add_argument("--attempt-id", required=True)
             p.add_argument("--approve-cancel", action="store_true")
         if name == "review":
-            p.add_argument("--decision", choices=("audit", "accept"), required=True)
+            p.add_argument("--decision", choices=("audit", "accept", "reject"), required=True)
             p.add_argument("--audit-evidence", type=Path)
             p.add_argument("--user-evidence", type=Path)
             p.add_argument("--verdict", choices=("pass", "fail", "blocked"), default="blocked",

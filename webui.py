@@ -339,13 +339,19 @@ class BridgeHandler(BaseHTTPRequestHandler):
             if action == "review":
                 directory = bridge.task_dir(self.server.store, task_id)
                 decision = body.get("decision")
-                if decision not in ("audit", "accept"):
-                    raise ValueError("decision 只支持 audit / accept")
+                if decision not in ("audit", "accept", "reject"):
+                    raise ValueError("decision 只支持 audit / accept / reject")
                 audit = self._save_evidence(directory, "audit", body.get("audit_evidence"))
                 user = None
-                if decision == "accept":
-                    user = self._save_evidence(directory, "user", body.get("user_evidence"))
-                return self._send(200, bridge.review(self.server.store, task_id, decision, audit, user))
+                if decision in ("accept", "reject") and body.get("user_evidence"):
+                    user = self._save_evidence(directory, "user", body["user_evidence"])
+                if decision == "accept" and user is None:
+                    raise ValueError("接收必须同时附只读审计和用户真实路径证据")
+                verdict = body.get("verdict")
+                if verdict not in (None, "pass", "fail", "blocked"):
+                    raise ValueError("verdict 只支持 pass / fail / blocked")
+                return self._send(200, bridge.review(self.server.store, task_id, decision, audit, user,
+                                                     verdict or "blocked"))
             return self._error(404, "接口不存在")
         except PermissionError as error:
             return self._error(403, error)
