@@ -541,6 +541,9 @@ def execute_attempt(directory, task, state, config, expected, attempt_dir, attem
         session_id = native["session_id"] if native else None
         native_warnings = []
         stop_confirmed = None
+        # 收尾循环确认到的停止结论（succeeded/interrupted/failed）。必须在此初始化：
+        # 正常完成路径不会走中断分支，final_outcome 保持 None，落盘不能用它代替本值。
+        stop_outcome = None
         started_ms = int(time.time() * 1000)
         interrupted = False
         final_usage = None      # 原生回读到的真实计费/用量；取不到保持 None，不补零
@@ -768,7 +771,7 @@ def execute_attempt(directory, task, state, config, expected, attempt_dir, attem
                   "upstream_requests": None, "usage": native.get("session", {}).get("tokens") if native else None,
                   # 本机实测 session.get 返回真实 cost 与 tokens，故单列一项；取不到为 None 而不是零。
                   "native_cost": final_usage,
-                  "stop_outcome": final_outcome,
+                  "stop_outcome": stop_outcome,
                   "usage_note": "保留原生 JSON 日志；未核实跨执行器 usage 语义，不估算次数或费用"}
         if status == "stop_unconfirmed":
             result["acceptance"] = "BLOCKED"
