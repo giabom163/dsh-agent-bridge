@@ -166,15 +166,35 @@ function renderDetail(data) {
   const gateSection = gate ? `<div class="detail-section"><h3>可审准入 · ${gate.reviewable ? "可审查" : "不可审查"}</h3><div class="detail-text">reviewable：${gate.reviewable ? "true" : "false"}\n原因：${esc(gate.reason || "无")}</div><p class="detail-subtle">${gate.reviewable ? "可进入只读审查；这不等于已通过，更不等于可接收。" : "该产物今天没有只读审查入口；按规则不得重派或接收。"}</p></div>` : "";
   const softReview = s.product_review, softAccept = s.human_accept;
   const reviewSection = (softReview || softAccept) ? `<div class="detail-section"><h3>产品意见 / 人工接收</h3><div class="detail-text">产品意见：${esc(softReview ? (softReview.verdict || "未记录") : "未记录")}${softReview ? `\n审查证据 SHA：${esc(String(softReview.evidence_sha256 || "").slice(0, 24))}` : ""}\n人工接收：${esc(softAccept ? (softAccept.decision || "未记录") : "未记录")}${softAccept ? `\n接收时间：${esc(prettyTime(softAccept.at))}` : ""}</div></div>` : "";
+  // 快捷操作与命令：把「打开目录」「常用 CLI」并进控制台，省掉额外的快捷方式/命令行窗口。
+  const paths = data.paths || {};
+  const openButtons = [["worktree", "打开工作区"], ["attempt", "打开尝试目录"], ["task", "打开任务目录"],
+                       ["evidence", "打开证据目录"], ["store", "打开 store"], ["reports", "打开报告目录"]]
+    .filter(([scope]) => paths[scope])
+    .map(([scope, label]) => `<button class="secondary-button small-button" data-open="${scope}">${label}</button>`).join("");
+  const commandRows = (data.commands || []).map(item => `<div class="cmd-row"><span class="cmd-label">${esc(item.label)}</span><code>${esc(item.command)}</code><button class="secondary-button small-button" data-copy="1">复制</button></div>`).join("");
+  const toolsSection = `<div class="detail-section"><h3>快捷操作与命令</h3>${openButtons ? `<div class="detail-actions">${openButtons}</div>` : ""}${commandRows ? `<div class="cmd-list">${commandRows}</div>` : ""}<p class="detail-subtle">「打开目录」由控制台在本机执行（只允许 store 内目录，或启动时用 --reports 配置的目录）；命令可直接复制到 PowerShell 执行。</p></div>`;
   const observation = data.native_observation ? `<div class="detail-section"><h3>最近原生回读</h3><div class="detail-text">${esc(prettyTime(data.native_observation.time))}\n原生 outcome：${esc(data.native_observation.session?.outcome || "尚无结果")}\n原生 idle 时间：${esc(data.native_observation.session?.time?.idle || "尚无记录")}\n${esc(data.native_observation.note)}</div></div>` : "";
   const job = data.job?.running ? `<div class="detail-section"><h3>桥任务</h3><div class="detail-text">执行器正在运行。刷新可读取最新状态。</div></div>` : data.job?.error ? `<div class="detail-section"><h3>操作失败 · BLOCKED</h3><div class="detail-text">${esc(data.job.error)}</div></div>` : "";
   $("detailPanel").innerHTML = `<div class="detail-head"><div><h2>${esc(task.title || task.goal)}</h2><p>${esc(task.task_id)} · revision ${esc(s.revision)}</p></div><button class="icon-button detail-close" id="detailClose" title="关闭">×</button></div>
     <div class="detail-meta"><div class="meta-box"><span>状态</span><b><span class="badge ${esc(s.status)}">${esc(labelStatus(s.status))}</span></b></div><div class="meta-box"><span>执行器 · 模型</span><b>${esc(task.executor)} · ${esc(labelModel(task.model))}</b></div><div class="meta-box"><span>验收（独立）</span><b>${esc(labelAcceptance(s.acceptance))}</b></div><div class="meta-box"><span>产品意见</span><b>${esc(s.product_review?.verdict || "未记录")}</b></div><div class="meta-box"><span>人工接收</span><b>${esc(s.human_accept?.decision || "未记录")}</b></div><div class="meta-box"><span>最后更新</span><b>${esc(prettyTime(s.finished_at || s.started_at || s.created_at))}</b></div></div>
     <div class="detail-section"><h3>任务目标</h3><div class="detail-text">${esc(task.goal)}</div></div>
     <div class="detail-section"><h3>允许修改</h3><div class="detail-text">${esc((task.allowed_paths || []).join("\n"))}</div></div>
-    <div class="detail-actions">${actionButtons(data)}</div><div class="detail-subtle">详情为 state.current_attempt 的当前尝试，不是完整历史。启动会新增 worktree 并运行新执行器，可能调用模型；桥未实证原生请求数量和预算限制。</div>${nativeSection}${observation}${effects}${job}${warningSection}${activity}${facts || result ? gateSection : ""}${reviewSection}${resultSection}`;
+    <div class="detail-actions">${actionButtons(data)}</div><div class="detail-subtle">详情为 state.current_attempt 的当前尝试，不是完整历史。启动会新增 worktree 并运行新执行器，可能调用模型；桥未实证原生请求数量和预算限制。</div>${nativeSection}${observation}${effects}${job}${warningSection}${activity}${facts || result ? gateSection : ""}${reviewSection}${toolsSection}${resultSection}`;
   $("detailClose").addEventListener("click", () => {state.selected=null; renderRows(); $("detailPanel").innerHTML=placeholder();});
   document.querySelectorAll("[data-action]").forEach(button => button.addEventListener("click", () => handleAction(button.dataset.action, data)));
+  document.querySelectorAll("[data-open]").forEach(button => button.addEventListener("click", () => openFolder(data.task.task_id, button.dataset.open)));
+  document.querySelectorAll("[data-copy]").forEach(button => button.addEventListener("click", async () => {
+    const code = button.closest(".cmd-row")?.querySelector("code");
+    try { await navigator.clipboard.writeText(code ? code.textContent : ""); toast("命令已复制到剪贴板。"); }
+    catch (error) { toast("复制失败，请手动选中命令文本。", true); }
+  }));
+}
+async function openFolder(taskId, scope) {
+  try {
+    const data = await api("/api/open", {method: "POST", body: JSON.stringify({task_id: taskId, scope})});
+    toast(`已在本机文件管理器打开：${data.opened}`);
+  } catch (error) { toast(error.message, true); }
 }
 async function handleAction(action, data) {
   if (action === "native-status") {

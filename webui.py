@@ -3,6 +3,7 @@ import argparse
 import base64
 import json
 import re
+import subprocess
 import sys
 import threading
 import uuid
@@ -25,13 +26,28 @@ WEB_ROOT = ROOT / "web"
 MAX_BODY = 1024 * 1024
 
 
+def open_folder(target):
+    """用系统文件管理器打开一个目录：固定可执行入口，不拼 shell 字符串、不解释用户输入。"""
+    path = Path(target).resolve()
+    if not path.is_dir():
+        raise FileNotFoundError("目录不存在：" + str(path))
+    if sys.platform == "win32":
+        subprocess.Popen(["explorer.exe", str(path)], close_fds=True)
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", str(path)])
+    else:
+        subprocess.Popen(["xdg-open", str(path)])
+    return str(path)
+
+
 class BridgeHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = False
 
-    def __init__(self, address, store, config):
+    def __init__(self, address, store, config, reports=None):
         super().__init__(address, BridgeHandler)
         self.store = Path(store).resolve()
+        self.reports = Path(reports).resolve() if reports else None
         self.config = config
         self.jobs = {}
         self.jobs_lock = threading.Lock()
@@ -127,7 +143,37 @@ class BridgeHandler(BaseHTTPRequestHandler):
         with self.server.jobs_lock:
             job = self.server.jobs.get(task_id)
         return {"task": task, "state": state, "result": result, "job": job,
-                "native": native, "native_observation": observation, "attempt": attempt_info, "activity": activity[-12:]}
+                "native": native, "native_observation": observation, "attempt": attempt_info,
+                "activity": activity[-12:], "commands": self._commands(task_id),
+                "paths": self._paths(task_id, state)}
+
+    def _commands(self, task_id):
+        """把常用 CLI 命令下发到界面，省掉另开命令行窗口。"""
+        base = '& "%s" -B "%s" --limit 3 --store "%s"' % (sys.executable, ARCHIVE, self.server.store)
+        return [
+            {"label": "查看状态", "command": "%s status %s" % (base, task_id)},
+            {"label": "只读派生视图（全部任务）", "command": "%s doctor" % base},
+            {"label": "只读审查（verdict=pass）",
+             "command": '%s review %s --decision audit --verdict pass --audit-evidence "<审计文件>"' % (base, task_id)},
+            {"label": "人工接收（需审计 + 用户证据）",
+             "command": '%s review %s --decision accept --audit-evidence "<审计文件>" --user-evidence "<你的证据文件>"' % (base, task_id)},
+            {"label": "存量回填（写历史，先逐文件备份）",
+             "command": "%s backfill %s --approve-backfill" % (base, task_id)},
+        ]
+
+    def _paths(self, task_id, state):
+        """界面「打开目录」可用的实际路径；只由 store 与 attempt 记录推导，不接受请求方给的路径。"""
+        directory = bridge.task_dir(self.server.store, task_id)
+        paths = {"store": str(self.server.store), "task": str(directory)}
+        attempt_id = state.get("current_attempt")
+        if attempt_id:
+            attempt_dir = directory / "attempts" / attempt_id
+            paths["attempt"] = str(attempt_dir)
+            paths["worktree"] = str(bridge.recorded_worktree(attempt_dir))
+            paths["evidence"] = str(attempt_dir / "web-evidence")
+        if self.server.reports:
+            paths["reports"] = str(self.server.reports)
+        return paths
 
     def do_GET(self):
         try:
@@ -211,6 +257,28 @@ class BridgeHandler(BaseHTTPRequestHandler):
             self._check_origin()
             body = self._body()
             path = urlsplit(self.path).path
+            if path == "/api/open":
+                # 打开目录：路径只从 store / attempt 推导（或启动时显式配置的报告目录），请求方不能指定任意路径。
+                scope = body.get("scope")
+                task_id = body.get("task_id")
+                paths = self._paths(self._safe_task_id(task_id), bridge.load_task(bridge.task_dir(self.server.store,
+                                                                                               self._safe_task_id(task_id)))[1]) if task_id else {}
+                if scope == "store":
+                    target = self.server.store
+                elif scope == "reports":
+                    if not self.server.reports:
+                        raise ValueError("本控制台启动时未配置报告目录（--reports）")
+                    target = self.server.reports
+                elif scope in ("task", "attempt", "worktree", "evidence"):
+                    if scope not in paths:
+                        raise ValueError("该任务没有这一层目录（可能还没有尝试）")
+                    target = paths[scope]
+                else:
+                    raise ValueError("scope 只支持 store / reports / task / attempt / worktree / evidence")
+                resolved = Path(target).resolve()
+                if scope != "reports" and resolved != self.server.store and not resolved.is_relative_to(self.server.store):
+                    raise PermissionError("只允许打开本 store 内的目录")
+                return self._send(200, {"opened": open_folder(resolved), "scope": scope})
             if path == "/api/tasks":
                 task = bridge.validate(body.get("contract"))
                 submissions = self.server.store / "web-submissions"
@@ -294,14 +362,17 @@ def main():
     parser.add_argument("--config", type=Path)
     parser.add_argument("--host", default="127.0.0.1", choices=("127.0.0.1",))
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--reports", type=Path, default=None,
+                        help="可选：界面上「打开报告目录」指向的目录（本轮产物所在处）")
     args = parser.parse_args()
     if not 1 <= args.limit <= 3:
         parser.error("--limit 必须为 1–3")
     if not 1 <= args.port <= 65535:
         parser.error("端口必须在 1–65535")
     config = bridge.read(args.config) if args.config else {}
-    server = BridgeHTTPServer((args.host, args.port), args.store, config)
+    server = BridgeHTTPServer((args.host, args.port), args.store, config, args.reports)
     print(json.dumps({"url": f"http://{args.host}:{args.port}/", "store": str(server.store),
+                      "reports": str(server.reports) if server.reports else None,
                       "model_requests": 0, "acceptance": "BLOCKED",
                       "security": "loopback only; mutating requests require same-origin browser"}, ensure_ascii=False),
           flush=True)
