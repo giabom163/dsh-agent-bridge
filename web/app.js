@@ -154,6 +154,14 @@ async function selectTask(id) {
     const data = await api(`/api/tasks/${encodeURIComponent(id)}`); renderDetail(data);
   } catch (error) { toast(error.message, true); }
 }
+// 芯片与折叠块：flowHtml / timelineHtml / renderDetail 都要用，必须放在模块作用域（曾因放在
+// renderDetail 内部导致 flowHtml 抛 "chip is not defined"，整个详情面板渲染失败——实机测试抓到）。
+function chip(label, value, tone) {
+  return `<span class="chip ${tone || ""}"><i>${esc(label)}</i>${esc(value)}</span>`;
+}
+function fold(title, body, count) {
+  return `<details class="fold"><summary>${esc(title)}${count ? `<b>${esc(String(count))}</b>` : ""}</summary><div class="fold-body">${body}</div></details>`;
+}
 function durationLabel(ms) {
   if (!isFinite(ms) || ms < 0) return "—";
   if (ms < 1000) return Math.round(ms) + " ms";
@@ -187,14 +195,22 @@ function timelineHtml(s, data) {
     const width = Math.max(((m.end - m.start) / total) * 100, 1.2);
     const label = [m.row.executor, m.row.model].filter(Boolean).join(" · ");
     const facts = m.row.execution_facts || {};
+    // 位置不用内联 style（CSP style-src 'self' 会拦掉），改成 data 属性，渲染后用 CSSOM 赋值。
     return `<div class="tl-row"><div class="tl-label">#${m.index} <span>${esc(m.row.attempt_id.slice(-8))}</span><i>${esc(label)}</i></div>
-      <div class="tl-track"><div class="tl-bar ${m.tone}" style="left:${left.toFixed(2)}%;width:${width.toFixed(2)}%" title="${esc(prettyTime(m.row.started_at))} → ${esc(m.row.finished_at ? prettyTime(m.row.finished_at) : "进行中")}"></div></div>
+      <div class="tl-track"><div class="tl-bar ${m.tone}" data-left="${left.toFixed(2)}" data-width="${width.toFixed(2)}" title="${esc(prettyTime(m.row.started_at))} → ${esc(m.row.finished_at ? prettyTime(m.row.finished_at) : "进行中")}"></div></div>
       <div class="tl-meta">${esc(durationLabel(m.end - m.start))}${m.row.exit_code !== undefined ? " · 退出码 " + esc(String(m.row.exit_code)) : ""}${facts.stop_reason ? " · " + esc(String(facts.stop_reason)) : ""}${m.failed ? " · 有机器错误" : ""}</div></div>`;
   }).join("");
   const repaired = marks.length > 1 || (s.human_accept && s.human_accept.decision === "reject") || s.revision > 1;
   const back = repaired ? `<div class="tl-back">↺ <b>review → repair</b>：这一轮里有 ${marks.length} 次尝试，后一次是在前一次产物基础上返修/重跑（旧 attempt 与产物不可变）。</div>` : "";
   return `<h3 class="pane-title">尝试时间线</h3><div class="timeline">${bars}</div>${back}
     <div class="tl-axis"><span>${esc(prettyTime(new Date(min).toISOString()))}</span><span>${esc(prettyTime(new Date(max).toISOString()))}</span></div>`;
+}
+// 渲染后把时间线几何写进 DOM（CSSOM 赋值不受 CSP style-src 限制）。
+function applyTimelineGeometry() {
+  document.querySelectorAll(".tl-bar[data-left]").forEach(bar => {
+    bar.style.left = bar.dataset.left + "%";
+    bar.style.width = bar.dataset.width + "%";
+  });
 }
 // 生命周期流程：把状态机画成一条链，当前节点高亮；分支状态（失败/停止未确认/返修/取消）挂在旁边。
 function flowHtml(s, data) {
@@ -224,8 +240,7 @@ function renderDetail(data) {
   const result = data.result;
   const n = data.native;
   // 每个块都做成「一行结论 + 需要时才展开」，避免详情面板被长文本撑爆。
-  const fold = (title, body, count) => `<details class="fold"><summary>${esc(title)}${count ? `<b>${esc(String(count))}</b>` : ""}</summary><div class="fold-body">${body}</div></details>`;
-  const chip = (label, value, tone) => `<span class="chip ${tone || ""}"><i>${esc(label)}</i>${esc(value)}</span>`;
+  // chip / fold 已在模块作用域定义（flowHtml 也要用）。
   const nativeSection = n ? fold("OpenCode 原生会话", `<div class="detail-text">标题：${esc(n.title)}
 会话 ID：${esc(n.session_id)}
 服务：${esc(n.server)}
@@ -289,6 +304,7 @@ ${esc(data.native_observation.note)}</div>`) : "";
     <div class="pane" data-pane="exec">${execPane}${activitySection}${nativeSection}${observation}${warningSection}</div>
     <div class="pane" data-pane="review">${reviewPane}</div>
     <div class="pane" data-pane="cmd">${cmdPane}</div>`;
+  applyTimelineGeometry();
   $("detailClose").addEventListener("click", () => {state.selected=null; renderRows(); $("detailPanel").innerHTML=placeholder();});
   document.querySelectorAll("[data-tab]").forEach(button => button.addEventListener("click", () => {
     document.querySelectorAll("[data-tab]").forEach(item => item.classList.toggle("active", item === button));
