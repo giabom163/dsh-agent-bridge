@@ -942,6 +942,24 @@ def review(store, task_id, decision, audit, user, verdict="blocked", review_inpu
         task, state = load_task(directory)
         attempt_id = state.get("current_attempt")
         attempt_dir = directory / "attempts" / attempt_id if attempt_id else None
+        if decision == "void":
+            # 作废 = 人工判定"这个任务没有价值"。它不依赖机器证据，因此**不看可审准入、也不要求 attempt 存在**
+            # （最该作废的恰恰是那些从没跑过、或跑完发现没用的任务）。
+            if state["status"] in ("running", "prepared", "cancel_requested"):
+                raise ValueError("运行中／待确认的任务不能作废；请先用 cancel 中断")
+            if not isinstance(reason, str) or not reason.strip():
+                raise ValueError("作废必须填写理由")
+            if isinstance(state.get("void"), dict):
+                raise ValueError("任务已经作废过；审计记录不覆盖，如需重新判定请新建任务说明原因")
+            record = reason.strip()[:2000]
+            previous_status = state.get("status")
+            state["void"] = {"reason": record, "at": now(), "actor": "user",
+                             "previous_status": previous_status,
+                             "previous_acceptance": state.get("acceptance")}
+            state.update(status="cancelled", acceptance="BLOCKED")
+            atomic(directory / "state.json", state)
+            event(directory, "void_task", reason=record, previous_status=previous_status)
+            return state
         if state["status"] not in ("awaiting_review", "awaiting_user"):
             gate = (state.get("review_gate") if isinstance(state.get("review_gate"), dict)
                     else reviewability(attempt_dir, state) if attempt_dir else {"reviewable": False, "reason": "no_attempt"})
@@ -988,16 +1006,7 @@ def review(store, task_id, decision, audit, user, verdict="blocked", review_inpu
             state["human_accept"] = {"decision": "reject", "reason": reason.strip()[:2000],
                                      "evidence": evidence, "at": now()}
         elif decision == "void":
-            # 人工判定"这个任务没有价值"：作废并沉底。不改历史产物、不删证据，只冻结状态。
-            if state["status"] in ("running", "prepared", "cancel_requested"):
-                raise ValueError("运行中／待确认的任务不能作废；请先用 cancel 中断")
-            if not isinstance(reason, str) or not reason.strip():
-                raise ValueError("作废必须填写理由")
-            record = reason.strip()[:2000]
-            state["void"] = {"reason": record, "at": now(), "actor": "user",
-                             "previous_status": state.get("status"),
-                             "previous_acceptance": state.get("acceptance")}
-            state.update(status="cancelled", acceptance="BLOCKED")
+            raise ValueError("作废分支已在入口处理（不会走到这里）")
         elif decision == "dismiss":
             # GitHub 式撤销打回：只对"已被人工打回"的任务生效，必须填理由，写 revisions 账后回到待接收。
             previous = state.get("human_accept") or {}
