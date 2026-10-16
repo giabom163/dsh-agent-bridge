@@ -982,6 +982,21 @@ def review(store, task_id, decision, audit, user, verdict="blocked", review_inpu
             state.update(status="rework", acceptance="BLOCKED")
             state["human_accept"] = {"decision": "reject", "reason": reason.strip()[:2000],
                                      "evidence": evidence, "at": now()}
+        elif decision == "dismiss":
+            # GitHub 式撤销打回：只对"已被人工打回"的任务生效，必须填理由，写 revisions 账后回到待接收。
+            previous = state.get("human_accept") or {}
+            if previous.get("decision") != "reject":
+                raise ValueError("只有被人工打回的任务可以撤销打回")
+            if not isinstance(reason, str) or not reason.strip():
+                raise ValueError("撤销打回必须填写理由")
+            record = reason.strip()[:2000]
+            state["revisions"] = list(state.get("revisions") or []) + [{
+                "action": "dismiss_reject", "at": now(), "actor": "user", "reason": record,
+                "previous_decision": previous.get("decision"), "previous_reason": previous.get("reason"),
+                "previous_at": previous.get("at")}]
+            state.update(status="awaiting_user", acceptance="BLOCKED")
+            state["human_accept"] = {**previous, "dismissed": True, "dismissed_at": now(),
+                                     "dismissed_reason": record}
         else:
             if "audit" not in evidence:
                 raise ValueError("审计阶段需要证据文件")
@@ -1135,7 +1150,7 @@ def main():
             p.add_argument("--attempt-id", required=True)
             p.add_argument("--approve-cancel", action="store_true")
         if name == "review":
-            p.add_argument("--decision", choices=("audit", "accept", "reject"), required=True)
+            p.add_argument("--decision", choices=("audit", "accept", "reject", "dismiss"), required=True)
             p.add_argument("--audit-evidence", type=Path)
             p.add_argument("--user-evidence", type=Path)
             p.add_argument("--verdict", choices=("pass", "fail", "blocked"), default="blocked",

@@ -148,6 +148,10 @@
         { selector: "edge", style: {
           "width": 2, "line-color": "#b9c6c0", "target-arrow-color": "#b9c6c0",
           "target-arrow-shape": "triangle", "curve-style": "bezier", "arrow-scale": 0.9 } },
+        { selector: "node.cluster", style: {
+          "background-color": "#f4f7f5", "background-opacity": 0.55, "border-width": 1,
+          "border-style": "dashed", "border-color": "#c7d3cd", "label": "data(label)",
+          "font-size": 9, "color": "#8b968f", "text-valign": "top", "text-margin-y": -4, "padding": 16 } },
         { selector: "node.selected", style: { "border-width": 4, "border-color": "#226b53" } },
         { selector: ".filtered-out", style: { "display": "none" } }
       ],
@@ -161,7 +165,14 @@
       return (row.task_id + " " + (task.goal || "")).toLowerCase().indexOf(state.filter) >= 0;
     }
 
-    function buildElements(tasks) {
+    function clusterKey(row) {
+      // 没有依赖边时按「仓库」聚类（同仓库的任务天然成组），仓库缺失归入"未记录仓库"。
+      var repo = String((row.task || {}).repo || "").replace(/[\\/]+$/, "");
+      var name = repo ? repo.split(/[\\/]/).pop() : "";
+      return name || "未记录仓库";
+    }
+
+    function buildElements(tasks, clustered) {
       var nodes = [], edges = [], seen = Object.create(null), missing = [];
       tasks.forEach(function (row) {
         var task = row.task || {}, s = row.state || {};
@@ -169,12 +180,28 @@
         if (!id) { return; }
         seen[id] = true;
         var statusValue = blank(s.status) ? "" : String(s.status);
-        nodes.push({ data: {
+        var data = {
           id: id,
           label: taskLabel(task, id),
           status: statusValue
-        }, classes: "status-" + safeClass(blank(statusValue) ? "unknown" : statusValue) });
+        };
+        if (clustered) { data.parent = "cluster:" + clusterKey(row); }
+        nodes.push({ data: data, classes: "status-" + safeClass(blank(statusValue) ? "unknown" : statusValue) });
       });
+      if (clustered) {
+        var counts = Object.create(null), parents = [];
+        nodes.forEach(function (node) {
+          var parent = node.data.parent;
+          counts[parent] = (counts[parent] || 0) + 1;
+        });
+        Object.keys(counts).forEach(function (parent) {
+          parents.push({ data: { id: parent, label: parent.replace("cluster:", "") + "（" + counts[parent] + "）" },
+                         classes: "cluster" });
+        });
+        // 只有一个聚类时包一层没有意义：撤掉父节点，保持原来的平铺。
+        if (parents.length > 1) { nodes = parents.concat(nodes); }
+        else { nodes.forEach(function (node) { delete node.data.parent; }); }
+      }
       tasks.forEach(function (row) {
         var task = row.task || {};
         var owner = row.task_id || task.task_id;
@@ -233,7 +260,7 @@
         parts.push("<span>依赖边均来自 task.dependencies。</span>");
       } else if (state.tasks.length) {
         // 无任何解析边时明确说明，不暗示边已存在或已实机覆盖。
-        parts.push("<span>暂无依赖记录（依赖边仅来自 task.dependencies）。</span>");
+        parts.push("<span>暂无依赖记录（依赖边仅来自 task.dependencies）——已按仓库聚类成组显示；有依赖的任务会自动切回层级图。</span>");
       }
       noteEl.innerHTML = parts.join("");
     }
@@ -272,12 +299,16 @@
       if (onSelect) { onSelect(taskId); }
     }
 
-    // 无依赖边时不做单排长列：用 Cytoscape core 内置 grid 多列铺开；
+    // 无依赖边时不画单排长列，也不留白：按仓库聚类成组（compound node）多列铺开；
     // 有真实依赖边时仍用 breadthfirst 保留真实层级关系。
     function layoutOptions(nodeCount) {
       if (cy.edges().length) {
         return { name: "breadthfirst", directed: true, spacingFactor: 1.15, padding: 26,
                  fit: true, animate: false, nodeDimensionsIncludeLabels: true };
+      }
+      if (cy.nodes("node.cluster").length) {
+        return { name: "cose", padding: 30, animate: false, fit: true,
+                 nodeDimensionsIncludeLabels: true, nodeRepulsion: 9000, idealEdgeLength: 60 };
       }
       var cols = Math.max(1, Math.ceil(Math.sqrt(Math.max(1, nodeCount))));
       return { name: "grid", cols: cols, avoidOverlap: true, avoidOverlapPadding: 12,
@@ -294,7 +325,11 @@
     controller.update = function (tasks, hasLoaded) {
       state.tasks = Array.isArray(tasks) ? tasks : [];
       state.hasLoaded = hasLoaded === true;
-      var built = buildElements(state.tasks);
+      var hasEdges = state.tasks.some(function (row) {
+        var deps = (row.task || {}).dependencies;
+        return Array.isArray(deps) && deps.length > 0;
+      });
+      var built = buildElements(state.tasks, !hasEdges);
       state.missing = built.missing;
       cy.elements().remove();
       cy.add(built.nodes.concat(built.edges));

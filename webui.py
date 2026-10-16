@@ -367,9 +367,11 @@ class BridgeHandler(BaseHTTPRequestHandler):
             if action == "review":
                 directory = bridge.task_dir(self.server.store, task_id)
                 decision = body.get("decision")
-                if decision not in ("audit", "accept", "reject"):
-                    raise ValueError("decision 只支持 audit / accept / reject")
-                audit = self._save_evidence(directory, "audit", body.get("audit_evidence"))
+                if decision not in ("audit", "accept", "reject", "dismiss"):
+                    raise ValueError("decision 只支持 audit / accept / reject / dismiss")
+                audit = self._save_evidence(directory, "audit", body.get("audit_evidence")) if body.get("audit_evidence") else None
+                if decision == "audit" and audit is None:
+                    raise ValueError("审计阶段需要只读审查证据")
                 user = None
                 if decision in ("accept", "reject") and body.get("user_evidence"):
                     user = self._save_evidence(directory, "user", body["user_evidence"])
