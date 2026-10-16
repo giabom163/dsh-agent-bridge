@@ -210,6 +210,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
             path = urlsplit(self.path).path
             if path == "/api/runtime":
                 return self._send(200, self.server.runtime)
+            # 浏览器会自动请求这两个；显式回 204，避免控制台日志里永远挂着 404 噪音。
+            if path in ("/favicon.ico", "/robots.txt"):
+                return self._send(204, b"")
             if path == "/":
                 page = (WEB_ROOT / "index.html").read_bytes()
                 return self._send(200, page, "text/html; charset=utf-8")
