@@ -12,3 +12,26 @@
 .cmd-row code{font:12px 'DM Mono',monospace;color:#2c3a35;overflow-wrap:anywhere;white-space:pre-wrap}
 .cmd-label{font-size:11px;font-weight:600;color:#66716c}
 .cmd-row .small-button{padding:4px 9px}
+
+/* 标签页 + 芯片 + 折叠 + 命令选择器（详情面板瘦身） */
+.tabs{display:flex;gap:6px;margin:14px 0 10px;border-bottom:1px solid var(--line)}
+.tab{border:0;background:transparent;padding:8px 12px;border-radius:9px 9px 0 0;color:#66716c;font-weight:600;font-size:13px}
+.tab.active{background:var(--mint);color:var(--green-dark)}
+.pane{display:none}
+.pane.active{display:block}
+.chips{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0 10px}
+.chip{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);border-radius:20px;padding:4px 10px;background:#fbfdfc;font-size:12px}
+.chip i{font-style:normal;color:#8b968f;font-size:11px}
+.chip.ok{border-color:#b7ddc6;background:#f1f9f4;color:#1f6b4c}
+.chip.bad{border-color:#e8c1be;background:#fdf3f2;color:#9d3b34}
+.chip.warn{border-color:#e8d8b0;background:#fdfaf0;color:#8a6a1f}
+.fold{border:1px solid var(--line);border-radius:9px;margin:6px 0;background:#fbfdfc}
+.fold>summary{cursor:pointer;padding:8px 10px;font-weight:600;font-size:12px;color:#4d5a54;list-style:none}
+.fold>summary::-webkit-details-marker{display:none}
+.fold>summary::before{content:"\25B8  ";color:#9aa5a0}
+.fold[open]>summary::before{content:"\25BE  "}
+.fold>summary b{margin-left:6px;font:500 11px 'DM Mono',monospace;color:#8b968f}
+.fold-body{padding:0 10px 10px}
+.cmd-picker{display:grid;grid-template-columns:minmax(120px,170px) minmax(0,1fr) auto;gap:8px;align-items:center;margin:8px 0}
+.cmd-picker select{height:32px;border:1px solid var(--line);border-radius:8px;background:#fff;padding:0 8px}
+.cmd-picker code{font:12px 'DM Mono',monospace;color:#2c3a35;overflow-wrap:anywhere;white-space:pre-wrap}

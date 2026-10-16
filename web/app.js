@@ -138,7 +138,10 @@ function renderDetail(data) {
   const task = data.task, s = data.state, plan = state.plans.get(task.task_id);
   const result = data.result;
   const n = data.native;
-  const nativeSection = n ? `<div class="detail-section"><h3>OpenCode 原生会话</h3><div class="detail-text">标题：${esc(n.title)}
+  // 每个块都做成「一行结论 + 需要时才展开」，避免详情面板被长文本撑爆。
+  const fold = (title, body, count) => `<details class="fold"><summary>${esc(title)}${count ? `<b>${esc(String(count))}</b>` : ""}</summary><div class="fold-body">${body}</div></details>`;
+  const chip = (label, value, tone) => `<span class="chip ${tone || ""}"><i>${esc(label)}</i>${esc(value)}</span>`;
+  const nativeSection = n ? fold("OpenCode 原生会话", `<div class="detail-text">标题：${esc(n.title)}
 会话 ID：${esc(n.session_id)}
 服务：${esc(n.server)}
 工作区：${esc(n.directory)}
@@ -146,49 +149,75 @@ function renderDetail(data) {
 可见性：${esc(n.visibility)}
 提示词：${n.prompt_sent ? "已交给 CLI，原生接纳以事件为准" : "尚未发送"}
 最近事件：${esc(n.last_event || "空会话")} ${esc(prettyTime(n.last_event_at))}
-原生停稳：${n.stop_confirmed === true ? "已确认" : n.stop_confirmed === false ? "未确认" : "尚未回收"}</div><p class="detail-subtle">在连接同一服务的 OpenCode 中打开上述工作区，按标题或会话 ID 查找。桥不更改 Console 工作区连接；客户端若连接另一服务，需要先配对。</p></div>` : "";
+原生停稳：${n.stop_confirmed === true ? "已确认" : n.stop_confirmed === false ? "未确认" : "尚未回收"}</div><p class="detail-subtle">在连接同一服务的 OpenCode 中按标题或会话 ID 查找该工作区。</p>`) : "";
   const warnings = result?.native_warnings || n?.warnings || [];
-  const warningSection = warnings.length ? `<div class="detail-section"><h3>原生工具警告</h3><div class="detail-text">${esc(warnings.map(x=>`${x.tool || x.stage}: ${x.message}`).join("\n"))}</div></div>` : "";
-  const activity = data.activity?.length ? `<div class="detail-section"><h3>最近执行输出</h3><div class="detail-text">${esc(data.activity.map(x=>[x.type,x.tool,x.status,x.text].filter(Boolean).join(" · ")).join("\n\n"))}</div></div>` : "";
-  const effects = plan ? `<div class="detail-section"><h3>执行计划 · ${esc(plan.plan_sha256.slice(0,12))}…</h3><div class="detail-text">${esc(plan.effects.join("\n"))}</div><div class="detail-subtle" style="margin-top:6px">${esc(plan.limitations.join("\n"))}</div></div>` : "";
-  // 执行事实（A 轴）与可审准入（B 轴）分开显示：二者都不再依赖 result 是否存在，
-  // 否则只读审查结论与"执行失败"都会无处显示（分账契约 §5.4）。
+  const warningSection = warnings.length ? fold("原生工具警告", `<div class="detail-text">${esc(warnings.map(x=>`${x.tool || x.stage}: ${x.message}`).join("\n"))}</div>`, warnings.length) : "";
+  const activitySection = data.activity?.length ? fold("最近执行输出", `<div class="detail-text">${esc(data.activity.map(x=>[x.type,x.tool,x.status,x.text].filter(Boolean).join(" · ")).join("\n\n"))}</div>`, data.activity.length) : "";
+  const effects = plan ? fold(`执行计划 · ${plan.plan_sha256.slice(0,12)}…`, `<div class="detail-text">${esc(plan.effects.join("\n"))}</div><div class="detail-subtle">${esc(plan.limitations.join("\n"))}</div>`) : "";
+  // 执行事实（A 轴）与可审准入（B 轴）：用芯片行表达，不再铺长段落。
   const facts = (result && result.execution_facts) || s.execution_facts || null;
   const gate = (result && result.review_gate) || s.review_gate || null;
-  const factsLine = facts ? [
-    `退出码：${esc(String(facts.exit_code))}`,
-    `停止原因：${esc(facts.stop_reason || "无")}`,
-    `原生停稳：${facts.stop_confirmed === true ? "已确认" : facts.stop_confirmed === false ? "未确认" : "未记录"}`,
-    `原生错误：${esc(String(facts.native_error_count))}`,
-    `超时：${facts.timed_out ? "是" : "否"}`,
-  ].join("\n") : "";
-  const resultSection = (result || facts) ? `<div class="detail-section"><h3>执行事实 · ${esc(labelStatus(s.status))}</h3><div class="detail-text">${factsLine ? factsLine + "\n" : ""}变更文件：${esc(((result && result.changes) || []).map(x=>x.path).join(", ") || "无")}${result && result.native_errors && result.native_errors.length ? `\n原生错误明细：${esc(result.native_errors.map(x=>x.message || JSON.stringify(x)).join("; "))}` : ""}</div></div>` : "";
-  const gateSection = gate ? `<div class="detail-section"><h3>可审准入 · ${gate.reviewable ? "可审查" : "不可审查"}</h3><div class="detail-text">reviewable：${gate.reviewable ? "true" : "false"}\n原因：${esc(gate.reason || "无")}</div><p class="detail-subtle">${gate.reviewable ? "可进入只读审查；这不等于已通过，更不等于可接收。" : "该产物今天没有只读审查入口；按规则不得重派或接收。"}</p></div>` : "";
+  const factsChips = facts ? [
+    chip("退出码", String(facts.exit_code), facts.exit_code === 0 ? "ok" : "bad"),
+    chip("停稳", facts.stop_confirmed === true ? "已确认" : facts.stop_confirmed === false ? "未确认" : "未记录",
+         facts.stop_confirmed === true ? "ok" : facts.stop_confirmed === false ? "bad" : ""),
+    chip("原生错误", String(facts.native_error_count), facts.native_error_count ? "bad" : "ok"),
+    chip("超时", facts.timed_out ? "是" : "否", facts.timed_out ? "warn" : ""),
+    chip("停止原因", facts.stop_reason || "无", facts.stop_reason ? "warn" : ""),
+  ].join("") : "";
+  const gateChip = gate ? chip(gate.reviewable ? "可审准入" : "不可审", gate.reviewable ? "可只读审查" : (gate.reason || "未记录"),
+                               gate.reviewable ? "ok" : "bad") : "";
+  const changed = ((result && result.changes) || []).map(x => x.path);
+  const changeLine = `<div class="detail-text">变更文件：${esc(changed.length ? changed.join("、") : "无")}</div>`;
+  const errorsDetail = result && result.native_errors && result.native_errors.length
+    ? fold("原生错误明细", `<div class="detail-text">${esc(result.native_errors.map(x=>x.message || JSON.stringify(x)).join("\n"))}</div>`, result.native_errors.length) : "";
+  const execPane = (result || facts) ? `<div class="chips">${factsChips}${gateChip}</div>${changed.length > 4 ? fold("变更文件", changeLine, changed.length) : changeLine}${errorsDetail}` : `<p class="detail-subtle">还没有执行结果。</p>`;
   const softReview = s.product_review, softAccept = s.human_accept;
-  const reviewSection = (softReview || softAccept) ? `<div class="detail-section"><h3>产品意见 / 人工接收</h3><div class="detail-text">产品意见：${esc(softReview ? (softReview.verdict || "未记录") : "未记录")}${softReview ? `\n审查证据 SHA：${esc(String(softReview.evidence_sha256 || "").slice(0, 24))}` : ""}\n人工接收：${esc(softAccept ? (softAccept.decision || "未记录") : "未记录")}${softAccept ? `\n接收时间：${esc(prettyTime(softAccept.at))}` : ""}</div></div>` : "";
-  // 快捷操作与命令：把「打开目录」「常用 CLI」并进控制台，省掉额外的快捷方式/命令行窗口。
+  const reviewChips = [
+    chip("产品意见", softReview ? (softReview.verdict || "未记录") : "未记录", softReview && softReview.verdict === "pass" ? "ok" : softReview && softReview.verdict === "fail" ? "bad" : ""),
+    chip("人工接收", softAccept ? (softAccept.decision || "未记录") : "未记录", softAccept && softAccept.decision === "accept" ? "ok" : ""),
+    softAccept ? chip("接收时间", prettyTime(softAccept.at)) : "",
+  ].join("");
+  const evidenceKeys = Object.keys(s.review_evidence || {});
+  const reviewPane = `<div class="chips">${reviewChips}</div>${gate && !gate.reviewable ? `<p class="detail-subtle">不可审原因：${esc(gate.reason || "未记录")}；按当前规则不得重派或接收。</p>` : ""}${gate && gate.reviewable ? `<p class="detail-subtle">可进入只读审查；这不等于已通过，更不等于可接收。</p>` : ""}${evidenceKeys.length ? fold("审查证据", `<div class="detail-text">${esc(evidenceKeys.map(k=>`${k}: ${String((s.review_evidence[k] || {}).sha256 || "").slice(0, 64)}`).join("\n"))}</div>`, evidenceKeys.length) : ""}`;
+  // 快捷操作与命令：目录按钮 + 命令下拉（不再一次摊开 5 条完整命令）。
   const paths = data.paths || {};
-  const openButtons = [["worktree", "打开工作区"], ["attempt", "打开尝试目录"], ["task", "打开任务目录"],
-                       ["evidence", "打开证据目录"], ["store", "打开 store"], ["reports", "打开报告目录"]]
+  const openButtons = [["worktree", "工作区"], ["attempt", "尝试目录"], ["task", "任务目录"],
+                       ["evidence", "证据目录"], ["store", "store"], ["reports", "报告目录"]]
     .filter(([scope]) => paths[scope])
-    .map(([scope, label]) => `<button class="secondary-button small-button" data-open="${scope}">${label}</button>`).join("");
-  const commandRows = (data.commands || []).map(item => `<div class="cmd-row"><span class="cmd-label">${esc(item.label)}</span><code>${esc(item.command)}</code><button class="secondary-button small-button" data-copy="1">复制</button></div>`).join("");
-  const toolsSection = `<div class="detail-section"><h3>快捷操作与命令</h3>${openButtons ? `<div class="detail-actions">${openButtons}</div>` : ""}${commandRows ? `<div class="cmd-list">${commandRows}</div>` : ""}<p class="detail-subtle">「打开目录」由控制台在本机执行（只允许 store 内目录，或启动时用 --reports 配置的目录）；命令可直接复制到 PowerShell 执行。</p></div>`;
-  const observation = data.native_observation ? `<div class="detail-section"><h3>最近原生回读</h3><div class="detail-text">${esc(prettyTime(data.native_observation.time))}\n原生 outcome：${esc(data.native_observation.session?.outcome || "尚无结果")}\n原生 idle 时间：${esc(data.native_observation.session?.time?.idle || "尚无记录")}\n${esc(data.native_observation.note)}</div></div>` : "";
-  const job = data.job?.running ? `<div class="detail-section"><h3>桥任务</h3><div class="detail-text">执行器正在运行。刷新可读取最新状态。</div></div>` : data.job?.error ? `<div class="detail-section"><h3>操作失败 · BLOCKED</h3><div class="detail-text">${esc(data.job.error)}</div></div>` : "";
+    .map(([scope, label]) => `<button class="secondary-button small-button" data-open="${scope}">${esc(label)}</button>`).join("");
+  const commands = data.commands || [];
+  const cmdPicker = commands.length ? `<div class="cmd-picker"><select id="cmdSelect">${commands.map((c, i) => `<option value="${i}">${esc(c.label)}</option>`).join("")}</select><code id="cmdPreview">${esc(commands[0].command)}</code><button class="secondary-button small-button" id="cmdCopy">复制</button></div><p class="detail-subtle">命令已按本控制台的实际 store 生成；「打开目录」只允许 store 内目录，或启动时用 --reports 配置的报告目录。</p>` : "";
+  const cmdPane = `${openButtons ? `<div class="detail-actions">${openButtons}</div>` : ""}${cmdPicker || "<p class=\"detail-subtle\">没有可下发的命令。</p>"}`;
+  const observation = data.native_observation ? fold("最近原生回读", `<div class="detail-text">${esc(prettyTime(data.native_observation.time))}
+原生 outcome：${esc(data.native_observation.session?.outcome || "尚无结果")}
+原生 idle 时间：${esc(data.native_observation.session?.time?.idle || "尚无记录")}
+${esc(data.native_observation.note)}</div>`) : "";
+  const job = data.job?.running ? `<div class="chips">${chip("桥任务", "执行器正在运行，刷新读取最新状态", "warn")}</div>` : data.job?.error ? `<div class="chips">${chip("操作失败", data.job.error, "bad")}</div>` : "";
+  const tabs = [["overview", "概览"], ["exec", "执行"], ["review", "审查"], ["cmd", "命令"]];
+  const tabBar = `<div class="tabs">${tabs.map(([key, label], index) => `<button class="tab ${index === 0 ? "active" : ""}" data-tab="${key}">${label}</button>`).join("")}</div>`;
   $("detailPanel").innerHTML = `<div class="detail-head"><div><h2>${esc(task.title || task.goal)}</h2><p>${esc(task.task_id)} · revision ${esc(s.revision)}</p></div><button class="icon-button detail-close" id="detailClose" title="关闭">×</button></div>
-    <div class="detail-meta"><div class="meta-box"><span>状态</span><b><span class="badge ${esc(s.status)}">${esc(labelStatus(s.status))}</span></b></div><div class="meta-box"><span>执行器 · 模型</span><b>${esc(task.executor)} · ${esc(labelModel(task.model))}</b></div><div class="meta-box"><span>验收（独立）</span><b>${esc(labelAcceptance(s.acceptance))}</b></div><div class="meta-box"><span>产品意见</span><b>${esc(s.product_review?.verdict || "未记录")}</b></div><div class="meta-box"><span>人工接收</span><b>${esc(s.human_accept?.decision || "未记录")}</b></div><div class="meta-box"><span>最后更新</span><b>${esc(prettyTime(s.finished_at || s.started_at || s.created_at))}</b></div></div>
-    <div class="detail-section"><h3>任务目标</h3><div class="detail-text">${esc(task.goal)}</div></div>
-    <div class="detail-section"><h3>允许修改</h3><div class="detail-text">${esc((task.allowed_paths || []).join("\n"))}</div></div>
-    <div class="detail-actions">${actionButtons(data)}</div><div class="detail-subtle">详情为 state.current_attempt 的当前尝试，不是完整历史。启动会新增 worktree 并运行新执行器，可能调用模型；桥未实证原生请求数量和预算限制。</div>${nativeSection}${observation}${effects}${job}${warningSection}${activity}${facts || result ? gateSection : ""}${reviewSection}${toolsSection}${resultSection}`;
+    <div class="detail-meta"><div class="meta-box"><span>状态</span><b><span class="badge ${esc(s.status)}">${esc(labelStatus(s.status))}</span></b></div><div class="meta-box"><span>验收（独立）</span><b>${esc(labelAcceptance(s.acceptance))}</b></div><div class="meta-box"><span>执行器 · 模型</span><b>${esc(task.executor)} · ${esc(labelModel(task.model))}</b></div><div class="meta-box"><span>最后更新</span><b>${esc(prettyTime(s.finished_at || s.started_at || s.created_at))}</b></div></div>
+    <div class="detail-actions">${actionButtons(data)}</div>${job}${tabBar}
+    <div class="pane active" data-pane="overview"><div class="detail-section"><h3>任务目标</h3><div class="detail-text">${esc(task.goal)}</div></div>${fold("允许修改", `<div class="detail-text">${esc((task.allowed_paths || []).join("\n"))}</div>`) }${effects}<p class="detail-subtle">详情为 state.current_attempt 的当前尝试，不是完整历史。</p></div>
+    <div class="pane" data-pane="exec">${execPane}${activitySection}${nativeSection}${observation}${warningSection}</div>
+    <div class="pane" data-pane="review">${reviewPane}</div>
+    <div class="pane" data-pane="cmd">${cmdPane}</div>`;
   $("detailClose").addEventListener("click", () => {state.selected=null; renderRows(); $("detailPanel").innerHTML=placeholder();});
+  document.querySelectorAll("[data-tab]").forEach(button => button.addEventListener("click", () => {
+    document.querySelectorAll("[data-tab]").forEach(item => item.classList.toggle("active", item === button));
+    document.querySelectorAll("[data-pane]").forEach(pane => pane.classList.toggle("active", pane.dataset.pane === button.dataset.tab));
+  }));
   document.querySelectorAll("[data-action]").forEach(button => button.addEventListener("click", () => handleAction(button.dataset.action, data)));
   document.querySelectorAll("[data-open]").forEach(button => button.addEventListener("click", () => openFolder(data.task.task_id, button.dataset.open)));
-  document.querySelectorAll("[data-copy]").forEach(button => button.addEventListener("click", async () => {
-    const code = button.closest(".cmd-row")?.querySelector("code");
-    try { await navigator.clipboard.writeText(code ? code.textContent : ""); toast("命令已复制到剪贴板。"); }
-    catch (error) { toast("复制失败，请手动选中命令文本。", true); }
-  }));
+  const selector = $("cmdSelect"), preview = $("cmdPreview");
+  if (selector && preview) {
+    selector.addEventListener("change", () => { preview.textContent = commands[Number(selector.value)].command; });
+    $("cmdCopy").addEventListener("click", async () => {
+      try { await navigator.clipboard.writeText(preview.textContent); toast("命令已复制。"); }
+      catch (error) { toast("复制失败，请手动选中命令文本。", true); }
+    });
+  }
 }
 async function openFolder(taskId, scope) {
   try {
