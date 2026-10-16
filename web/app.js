@@ -151,14 +151,28 @@ function renderDetail(data) {
   const warningSection = warnings.length ? `<div class="detail-section"><h3>原生工具警告</h3><div class="detail-text">${esc(warnings.map(x=>`${x.tool || x.stage}: ${x.message}`).join("\n"))}</div></div>` : "";
   const activity = data.activity?.length ? `<div class="detail-section"><h3>最近执行输出</h3><div class="detail-text">${esc(data.activity.map(x=>[x.type,x.tool,x.status,x.text].filter(Boolean).join(" · ")).join("\n\n"))}</div></div>` : "";
   const effects = plan ? `<div class="detail-section"><h3>执行计划 · ${esc(plan.plan_sha256.slice(0,12))}…</h3><div class="detail-text">${esc(plan.effects.join("\n"))}</div><div class="detail-subtle" style="margin-top:6px">${esc(plan.limitations.join("\n"))}</div></div>` : "";
-  const resultSection = result ? `<div class="detail-section"><h3>机器结果 · ${esc(labelAcceptance(result.acceptance))}</h3><div class="detail-text">退出码：${esc(result.exit_code)}\n状态：${esc(labelStatus(s.status))}\n变更文件：${esc((result.changes || []).map(x=>x.path).join(", ") || "无")}${result.native_errors?.length ? `\n错误：${esc(result.native_errors.map(x=>x.message).join("; "))}` : ""}</div></div>` : "";
+  // 执行事实（A 轴）与可审准入（B 轴）分开显示：二者都不再依赖 result 是否存在，
+  // 否则只读审查结论与"执行失败"都会无处显示（分账契约 §5.4）。
+  const facts = (result && result.execution_facts) || s.execution_facts || null;
+  const gate = (result && result.review_gate) || s.review_gate || null;
+  const factsLine = facts ? [
+    `退出码：${esc(String(facts.exit_code))}`,
+    `停止原因：${esc(facts.stop_reason || "无")}`,
+    `原生停稳：${facts.stop_confirmed === true ? "已确认" : facts.stop_confirmed === false ? "未确认" : "未记录"}`,
+    `原生错误：${esc(String(facts.native_error_count))}`,
+    `超时：${facts.timed_out ? "是" : "否"}`,
+  ].join("\n") : "";
+  const resultSection = (result || facts) ? `<div class="detail-section"><h3>执行事实 · ${esc(labelStatus(s.status))}</h3><div class="detail-text">${factsLine ? factsLine + "\n" : ""}变更文件：${esc(((result && result.changes) || []).map(x=>x.path).join(", ") || "无")}${result && result.native_errors && result.native_errors.length ? `\n原生错误明细：${esc(result.native_errors.map(x=>x.message || JSON.stringify(x)).join("; "))}` : ""}</div></div>` : "";
+  const gateSection = gate ? `<div class="detail-section"><h3>可审准入 · ${gate.reviewable ? "可审查" : "不可审查"}</h3><div class="detail-text">reviewable：${gate.reviewable ? "true" : "false"}\n原因：${esc(gate.reason || "无")}</div><p class="detail-subtle">${gate.reviewable ? "可进入只读审查；这不等于已通过，更不等于可接收。" : "该产物今天没有只读审查入口；按规则不得重派或接收。"}</p></div>` : "";
+  const softReview = s.product_review, softAccept = s.human_accept;
+  const reviewSection = (softReview || softAccept) ? `<div class="detail-section"><h3>产品意见 / 人工接收</h3><div class="detail-text">产品意见：${esc(softReview ? (softReview.verdict || "未记录") : "未记录")}${softReview ? `\n审查证据 SHA：${esc(String(softReview.evidence_sha256 || "").slice(0, 24))}` : ""}\n人工接收：${esc(softAccept ? (softAccept.decision || "未记录") : "未记录")}${softAccept ? `\n接收时间：${esc(prettyTime(softAccept.at))}` : ""}</div></div>` : "";
   const observation = data.native_observation ? `<div class="detail-section"><h3>最近原生回读</h3><div class="detail-text">${esc(prettyTime(data.native_observation.time))}\n原生 outcome：${esc(data.native_observation.session?.outcome || "尚无结果")}\n原生 idle 时间：${esc(data.native_observation.session?.time?.idle || "尚无记录")}\n${esc(data.native_observation.note)}</div></div>` : "";
   const job = data.job?.running ? `<div class="detail-section"><h3>桥任务</h3><div class="detail-text">执行器正在运行。刷新可读取最新状态。</div></div>` : data.job?.error ? `<div class="detail-section"><h3>操作失败 · BLOCKED</h3><div class="detail-text">${esc(data.job.error)}</div></div>` : "";
   $("detailPanel").innerHTML = `<div class="detail-head"><div><h2>${esc(task.title || task.goal)}</h2><p>${esc(task.task_id)} · revision ${esc(s.revision)}</p></div><button class="icon-button detail-close" id="detailClose" title="关闭">×</button></div>
-    <div class="detail-meta"><div class="meta-box"><span>状态</span><b><span class="badge ${esc(s.status)}">${esc(labelStatus(s.status))}</span></b></div><div class="meta-box"><span>执行器 · 模型</span><b>${esc(task.executor)} · ${esc(labelModel(task.model))}</b></div><div class="meta-box"><span>验收（独立）</span><b>${esc(labelAcceptance(s.acceptance))}</b></div><div class="meta-box"><span>最后更新</span><b>${esc(prettyTime(s.finished_at || s.started_at || s.created_at))}</b></div></div>
+    <div class="detail-meta"><div class="meta-box"><span>状态</span><b><span class="badge ${esc(s.status)}">${esc(labelStatus(s.status))}</span></b></div><div class="meta-box"><span>执行器 · 模型</span><b>${esc(task.executor)} · ${esc(labelModel(task.model))}</b></div><div class="meta-box"><span>验收（独立）</span><b>${esc(labelAcceptance(s.acceptance))}</b></div><div class="meta-box"><span>产品意见</span><b>${esc(s.product_review?.verdict || "未记录")}</b></div><div class="meta-box"><span>人工接收</span><b>${esc(s.human_accept?.decision || "未记录")}</b></div><div class="meta-box"><span>最后更新</span><b>${esc(prettyTime(s.finished_at || s.started_at || s.created_at))}</b></div></div>
     <div class="detail-section"><h3>任务目标</h3><div class="detail-text">${esc(task.goal)}</div></div>
     <div class="detail-section"><h3>允许修改</h3><div class="detail-text">${esc((task.allowed_paths || []).join("\n"))}</div></div>
-    <div class="detail-actions">${actionButtons(data)}</div><div class="detail-subtle">详情为 state.current_attempt 的当前尝试，不是完整历史。启动会新增 worktree 并运行新执行器，可能调用模型；桥未实证原生请求数量和预算限制。</div>${nativeSection}${observation}${effects}${job}${warningSection}${activity}${resultSection}`;
+    <div class="detail-actions">${actionButtons(data)}</div><div class="detail-subtle">详情为 state.current_attempt 的当前尝试，不是完整历史。启动会新增 worktree 并运行新执行器，可能调用模型；桥未实证原生请求数量和预算限制。</div>${nativeSection}${observation}${effects}${job}${warningSection}${activity}${facts || result ? gateSection : ""}${reviewSection}${resultSection}`;
   $("detailClose").addEventListener("click", () => {state.selected=null; renderRows(); $("detailPanel").innerHTML=placeholder();});
   document.querySelectorAll("[data-action]").forEach(button => button.addEventListener("click", () => handleAction(button.dataset.action, data)));
 }

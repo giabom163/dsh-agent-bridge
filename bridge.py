@@ -758,12 +758,23 @@ def execute_attempt(directory, task, state, config, expected, attempt_dir, attem
         except Exception as error:
             changes, violations, missing = [], [], []
             native_errors.append({"message": scrub(str(error)), "stage": "collect"})
-        failed = exit_code != 0 or bool(native_errors or violations or missing or stop_reason)
-        status = "stop_unconfirmed" if native and stop_confirmed is not True else "cancelled" if stop_reason == "cancelled" else "failed" if failed else "awaiting_review"
+        # A 轴：执行事实。stop_reason 单独成字段，不再与产品越界／缺产物挤进同一个 bool。
+        exec_failed = exit_code != 0 or bool(native_errors or violations or missing)
+        facts = {"exit_code": exit_code, "stop_reason": stop_reason,
+                 "native_error_count": len(native_errors),
+                 "violations": violations, "missing_artifacts": missing,
+                 "stop_confirmed": stop_confirmed, "timed_out": stop_reason == "timeout"}
+        status = ("stop_unconfirmed" if native and stop_confirmed is not True
+                  else "cancelled" if stop_reason == "cancelled"
+                  else "failed" if exec_failed
+                  else "awaiting_review")
         result = {"attempt_id": attempt_id, "task_id": task_id, "revision": state["revision"],
                   "contract_sha256": state["contract_sha256"], "exit_code": exit_code, "stop_reason": stop_reason,
                   "session_id": session_id, "changes": changes, "violations": violations, "missing_artifacts": missing,
-                  "native_errors": native_errors, "finished_at": now(), "acceptance": "FAIL" if failed else "BLOCKED",
+                  "native_errors": native_errors, "finished_at": now(),
+                  # acceptance 只表达机器执行安全性（BLOCKED / PASS，不再写 FAIL）；
+                  # 执行失败由 execution_facts + review_gate 表达，CLI 退出码见 exit_code_for()。
+                  "acceptance": "BLOCKED",
                   "native_warnings": native_warnings, "native_stop_confirmed": stop_confirmed,
                   "git_marker_sha256": git_marker,
                   "base_commit": approved["base_commit"],
@@ -773,15 +784,21 @@ def execute_attempt(directory, task, state, config, expected, attempt_dir, attem
                   "native_cost": final_usage,
                   "stop_outcome": stop_outcome,
                   "usage_note": "保留原生 JSON 日志；未核实跨执行器 usage 语义，不估算次数或费用"}
-        if status == "stop_unconfirmed":
-            result["acceptance"] = "BLOCKED"
+        result["execution_facts"] = facts
+        # B 轴：可审准入。此处结果刚写出，稳定性用 stable=True 表达；result_sha256 的占位只为满足
+        # "必须已登记结果哈希"这一项，真实哈希在落盘后回填到 state 与 CLI 退出码判定。
+        gate = reviewability(attempt_dir, {**state, "result_sha256": "pending"},
+                             result=result, stable=True)
+        result["reviewable"] = gate["reviewable"]
+        result["review_gate"] = gate
         atomic(attempt_dir / "result.json", result)
         current = read(directory / "state.json")
         if current["current_attempt"] != attempt_id or current["contract_sha256"] != result["contract_sha256"]:
             event(directory, "stale_result_rejected", attempt_id=attempt_id)
             raise ValueError("当前尝试或契约已变化；迟到结果已保存但拒绝覆盖状态")
         state.update(status=status, acceptance=result["acceptance"], finished_at=now(),
-                     result_sha256=digest((attempt_dir / "result.json").read_bytes()))
+                     result_sha256=digest((attempt_dir / "result.json").read_bytes()),
+                     reviewable=gate["reviewable"], review_gate=gate, execution_facts=facts)
         atomic(directory / "state.json", state)
         event(directory, "collected", attempt_id=attempt_id, status=status, exit_code=exit_code,
               result_sha256=digest((attempt_dir / "result.json").read_bytes()))
@@ -816,13 +833,116 @@ def native_status(store, task_id, config):
     return observation
 
 
-def review(store, task_id, decision, audit, user):
+def stable_result(attempt_dir, state):
+    """结果文件是否与登记的 result_sha256 一致。review() 与 reviewability() 共用，避免两处实现漂移。"""
+    path = Path(attempt_dir) / "result.json"
+    if not path.is_file():
+        return False
+    recorded = state.get("result_sha256")
+    return isinstance(recorded, str) and digest(path.read_bytes()) == recorded
+
+
+def execution_facts(result):
+    """A 轴：执行事实。新结果直接读 execution_facts；旧结果现场派生，不改写历史文件。"""
+    facts = result.get("execution_facts")
+    if isinstance(facts, dict):
+        return facts
+    errors = result.get("native_errors")
+    return {"exit_code": result.get("exit_code"),
+            "stop_reason": result.get("stop_reason"),
+            "native_error_count": len(errors) if isinstance(errors, list) else None,
+            "violations": result.get("violations") or [],
+            "missing_artifacts": result.get("missing_artifacts") or [],
+            "stop_confirmed": result.get("native_stop_confirmed"),
+            "timed_out": result.get("stop_reason") == "timeout",
+            "derived_from": "legacy-result"}
+
+
+def reviewability(attempt_dir, state, result=None, stable=None):
+    """B 轴：可审准入（准入，不是通过）。顺序固定、可复算，见分账契约 §2.2。
+
+    stop_reason == "timeout" 不参与判定（只进 execution_facts）；
+    stop_confirmed is not True（未知）仍然硬拒，安全门不放宽。
+    stable 由调用方给出时跳过磁盘复核（用于刚写出的结果）。
+    """
+    attempt_dir = Path(attempt_dir)
+    if result is None:
+        path = attempt_dir / "result.json"
+        if not path.is_file():
+            return {"reviewable": False, "reason": "result_missing"}
+        result = read(path)
+    facts = execution_facts(result)
+    # 停止确认只对"有原生会话"的尝试适用：非原生（standalone / dsh）没有原生会话可确认，
+    # 其停止事实由桥自身进程回收与 exit_code 表达。这与 status 判定里 `native and ...` 同口径。
+    native_present = (attempt_dir / "native-session.json").is_file()
+    reason = None
+
+    def first(condition, name):
+        nonlocal reason
+        if reason is None and condition:
+            reason = name
+
+    first(native_present and facts.get("stop_confirmed") is not True, "stop_unconfirmed")
+    first(facts.get("exit_code") != 0, "exit_nonzero")
+    count = facts.get("native_error_count")
+    first(bool(count) if isinstance(count, int) else bool(result.get("native_errors")), "native_errors")
+    first(bool(facts.get("violations")), "violations")
+    first(bool(facts.get("missing_artifacts")), "missing_artifacts")
+    first(not result.get("after_snapshot_sha256"), "artifacts_incomplete")
+    first(not result.get("git_marker_sha256"), "artifacts_incomplete")
+    first(not result.get("base_commit"), "artifacts_incomplete")
+    first(not isinstance(state.get("result_sha256"), str), "artifacts_incomplete")
+    for change in result.get("changes") or []:
+        first(not change.get("before_sha256") or not change.get("after_sha256"), "artifacts_incomplete")
+    if stable is None:
+        stable = stable_result(attempt_dir, state)
+    first(stable is not True, "file_unstable")
+    return {"reviewable": reason is None, "reason": reason}
+
+
+def review_inputs(store, items):
+    """只读复审引用的外部产物（分账契约 §3.3）：核对存在性、字节哈希与停稳确认。"""
+    checked = []
+    for item in items:
+        if not isinstance(item, dict):
+            raise ValueError("审查输入必须是对象数组")
+        task_id, attempt_id, sha = item.get("task_id"), item.get("attempt_id"), item.get("result_sha256")
+        if not isinstance(task_id, str) or not isinstance(attempt_id, str) or not isinstance(sha, str):
+            raise ValueError("审查输入缺 task_id / attempt_id / result_sha256")
+        attempt_dir = task_dir(store, task_id) / "attempts" / attempt_id
+        path = attempt_dir / "result.json"
+        if not path.is_file():
+            raise ValueError("审查输入引用的结果不存在：" + task_id + "/" + attempt_id)
+        if digest(path.read_bytes()) != sha:
+            raise ValueError("审查输入 sha256 与实际字节不一致：" + task_id + "/" + attempt_id)
+        if execution_facts(read(path)).get("stop_confirmed") is not True:
+            raise ValueError("审查输入引用的产物未确认停稳：" + task_id + "/" + attempt_id)
+        artifacts = []
+        worktree = recorded_worktree(attempt_dir)
+        for artifact in item.get("artifacts") or []:
+            if not isinstance(artifact, dict) or not isinstance(artifact.get("path"), str):
+                raise ValueError("审查输入 artifacts 项缺 path")
+            target = inside(worktree, artifact["path"])
+            if not target.is_file() or digest(target.read_bytes()) != artifact.get("sha256"):
+                raise ValueError("审查输入产物与字节不一致：" + artifact["path"])
+            artifacts.append({"path": artifact["path"], "sha256": artifact["sha256"]})
+        checked.append({"task_id": task_id, "attempt_id": attempt_id, "result_sha256": sha,
+                        "artifacts": artifacts, "stop_confirmed": True})
+    return checked
+
+
+def review(store, task_id, decision, audit, user, verdict="blocked", review_input=None):
     directory = task_dir(store, task_id)
     with writer(store):
         task, state = load_task(directory)
+        attempt_id = state.get("current_attempt")
+        attempt_dir = directory / "attempts" / attempt_id if attempt_id else None
         if state["status"] not in ("awaiting_review", "awaiting_user"):
-            raise ValueError("任务未进入可审查状态")
-        result_path = directory / "attempts" / state["current_attempt"] / "result.json"
+            gate = (state.get("review_gate") if isinstance(state.get("review_gate"), dict)
+                    else reviewability(attempt_dir, state) if attempt_dir else {"reviewable": False, "reason": "no_attempt"})
+            if not gate.get("reviewable"):
+                raise ValueError("任务未进入可审查状态（review_gate.reason=%s）" % gate.get("reason"))
+        result_path = attempt_dir / "result.json"
         if digest(result_path.read_bytes()) != state.get("result_sha256"):
             raise ValueError("结果文件被改写；拒绝接收")
         result = read(result_path)
@@ -836,11 +956,12 @@ def review(store, task_id, decision, audit, user):
                     raise ValueError("证据文件不存在或为空：" + key)
                 evidence[key] = {"path": str(p), "sha256": digest(p.read_bytes())}
         if decision == "accept":
+            # 机器接收门一字不改：可审 ≠ 可接收。
             if result["exit_code"] != 0 or result["violations"] or result["missing_artifacts"] or result["native_errors"]:
                 raise ValueError("机器证据不满足，拒绝接收")
             if set(evidence) != {"audit", "user"}:
                 raise ValueError("接收必须同时附只读审计和用户真实路径证据")
-            worktree = recorded_worktree(directory / "attempts" / state["current_attempt"])
+            worktree = recorded_worktree(attempt_dir)
             if digest((worktree / ".git").read_bytes()) != result["git_marker_sha256"]:
                 raise ValueError("审查期间 .git 指针发生变化，拒绝接收")
             if git(worktree, "rev-parse", "HEAD").decode().strip() != result["base_commit"]:
@@ -848,13 +969,28 @@ def review(store, task_id, decision, audit, user):
             if digest(json_bytes(snapshot(worktree))) != result["after_snapshot_sha256"]:
                 raise ValueError("回收后工作区又被修改，拒绝接收")
             state.update(status="accepted", acceptance="PASS")
+            # D 轴：人工接收。acceptance 只表达机器执行安全性，不再承载产品意见。
+            state["human_accept"] = {"decision": "accept", "evidence": evidence, "at": now()}
         else:
             if "audit" not in evidence:
                 raise ValueError("审计阶段需要证据文件")
+            if verdict not in ("pass", "fail", "blocked"):
+                raise ValueError("verdict 只支持 pass / fail / blocked")
             state.update(status="awaiting_user", acceptance="BLOCKED")
+            # C 轴：产品意见（只读审查结论），与人工接收分开记录。
+            state["product_review"] = {"verdict": verdict, "reviewer": "user",
+                                       "evidence_sha256": evidence["audit"]["sha256"],
+                                       "at": now(), "findings": []}
+        if review_input:
+            evidence["review_inputs"] = review_inputs(store, read(Path(review_input)))
+        gate = reviewability(attempt_dir, state, result=result)
+        state["reviewable"] = gate["reviewable"]
+        state["review_gate"] = gate
         state["review_evidence"] = evidence
         atomic(directory / "state.json", state)
-        event(directory, "human_review", decision=decision, evidence=evidence)
+        event(directory, "human_review", decision=decision,
+              verdict=None if decision == "accept" else verdict,
+              evidence=evidence, reviewable=gate["reviewable"], review_gate_reason=gate["reason"])
     return state
 
 
@@ -872,6 +1008,46 @@ def revise(store, task_id, source):
         atomic(directory / "state.json", state)
         event(directory, "revised", revision=state["revision"], contract_sha256=state["contract_sha256"])
     return state
+
+
+def review_gates(store):
+    """§4.1 只读派生视图：遍历各 task 当前 attempt，对现存 result 计算 review_gate；不写任何文件。"""
+    store = Path(store)
+    tasks = store / "tasks"
+    derived = {}
+    if not tasks.is_dir():
+        return derived
+    for directory in sorted(tasks.iterdir()):
+        if not (directory / "state.json").is_file():
+            continue
+        state = read(directory / "state.json")
+        attempt_id = state.get("current_attempt")
+        attempt_dir = directory / "attempts" / attempt_id if attempt_id else None
+        entry = {"title": state.get("title"), "status": state.get("status"),
+                 "acceptance": state.get("acceptance"), "revision": state.get("revision"),
+                 "current_attempt": attempt_id}
+        if attempt_dir and (attempt_dir / "result.json").is_file():
+            result = read(attempt_dir / "result.json")
+            gate = reviewability(attempt_dir, state, result=result)
+            facts = execution_facts(result)
+            entry["reviewable"] = gate["reviewable"]
+            entry["review_gate"] = gate
+            entry["execution_facts"] = {key: facts.get(key) for key in
+                                        ("exit_code", "stop_reason", "native_error_count", "violations",
+                                         "missing_artifacts", "stop_confirmed", "timed_out")}
+        else:
+            entry["reviewable"] = False
+            entry["review_gate"] = {"reviewable": False, "reason": "result_missing"}
+        derived[directory.name] = entry
+    return derived
+
+
+def exit_code_for(result):
+    """§5.5 退出码：不再依赖 acceptance 取值；旧结果仍看 acceptance == FAIL。"""
+    facts = result.get("execution_facts")
+    exec_failed = bool(facts) and bool(facts.get("exit_code") != 0 or facts.get("native_error_count")
+                                       or facts.get("violations") or facts.get("missing_artifacts"))
+    return 1 if (result.get("acceptance") == "FAIL" or exec_failed) else 0
 
 
 def main():
@@ -896,6 +1072,10 @@ def main():
             p.add_argument("--decision", choices=("audit", "accept"), required=True)
             p.add_argument("--audit-evidence", type=Path)
             p.add_argument("--user-evidence", type=Path)
+            p.add_argument("--verdict", choices=("pass", "fail", "blocked"), default="blocked",
+                           help="只读审查（audit）的产品意见；accept 不使用本字段")
+            p.add_argument("--review-input", type=Path,
+                           help="可选：只读复审引用的外部产物数组（JSON，分账契约 §3.3）")
         if name == "revise":
             p.add_argument("contract", type=Path)
     args = parser.parse_args()
@@ -903,16 +1083,18 @@ def main():
         parser.error("Demo --limit 必须为 1–3；每次 run 仅执行一个任务")
     store = args.store.resolve()
     config = read(args.config) if args.config else {}
-    if args.command == "doctor": result = {"facts": adapters.facts(config), "model_requests": 0, "acceptance": "BLOCKED"}
+    if args.command == "doctor":
+        result = {"facts": adapters.facts(config), "store": str(store),
+                  "review_gates": review_gates(store), "model_requests": 0, "acceptance": "BLOCKED"}
     elif args.command == "submit": result = submit(store, args.contract)
     elif args.command == "plan": result = plan(store, args.task_id, config)
     elif args.command == "status": result = load_task(task_dir(store, args.task_id))[1]
     elif args.command in ("prepare", "run"): result = run(store, args.task_id, config, args.plan_sha256, args.approve_start, args.ack_unmetered, args.command == "prepare", args.confirm_visible)
     elif args.command == "cancel": result = cancel(store, args.task_id, args.attempt_id, args.approve_cancel)
-    elif args.command == "review": result = review(store, args.task_id, args.decision, args.audit_evidence, args.user_evidence)
+    elif args.command == "review": result = review(store, args.task_id, args.decision, args.audit_evidence, args.user_evidence, args.verdict, args.review_input)
     else: result = revise(store, args.task_id, args.contract)
     print(scrub(json.dumps(result, ensure_ascii=False, indent=2)))
-    return 1 if result.get("acceptance") == "FAIL" else 0
+    return exit_code_for(result)
 
 
 if __name__ == "__main__":

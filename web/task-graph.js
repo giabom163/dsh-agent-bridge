@@ -26,7 +26,7 @@
   // 桥取消 API 的临时过程标签，不属于契约 10 状态，单独保留。
   var PROCESS_LABELS = { cancel_requested: "取消中（过程标签）" };
   // 3 个验收值，独立于任务状态。
-  var ACCEPTANCE_LABELS = { PASS: "通过", FAIL: "失败", BLOCKED: "阻塞" };
+  var ACCEPTANCE_LABELS = { PASS: "通过", FAIL: "失败", BLOCKED: "阻塞", PENDING: "待审" };
 
   function esc(value) {
     return String(value == null ? "" : value).replace(/[&<>"']/g, function (ch) {
@@ -46,6 +46,16 @@
     if (blank(value)) { return "未知（未记录）"; }
     if (ACCEPTANCE_LABELS[value]) { return ACCEPTANCE_LABELS[value]; }
     return "未知（" + value + "）"; // 不默认 PASS
+  }
+  // 产品意见（C 轴）与人工接收（D 轴）现在是各自独立的字段；旧数据没有时显示"未记录"，不倒推结论。
+  var REVIEW_LABELS = { pass: "通过", fail: "不通过", blocked: "阻塞" };
+  function reviewLabel(review) {
+    if (!review || typeof review !== "object") { return "未记录"; }
+    return REVIEW_LABELS[review.verdict] || "未知（" + String(review.verdict) + "）";
+  }
+  function acceptLabel(record) {
+    if (!record || typeof record !== "object") { return "未记录"; }
+    return record.decision === "accept" ? "已接收" : record.decision === "reject" ? "已驳回" : "未记录";
   }
   function modelLabel(value) { return blank(value) ? "未记录" : String(value); }
   // 图内节点短标签：优先简短 title（限长），无 title 用 task_id 尾部并加省略标识，避免公共
@@ -201,6 +211,8 @@
           esc(listLabel(task, row.task_id)) + "</button>" +
           '<span class="' + badgeClass(s.status) + '">' + esc(statusLabel(s.status)) + "</span>" +
           '<span class="graph-list-accept">验收：' + esc(acceptanceLabel(s.acceptance)) + "</span>" +
+          '<span class="graph-list-review">意见：' + esc(reviewLabel(s.product_review)) + "</span>" +
+          '<span class="graph-list-review">接收：' + esc(acceptLabel(s.human_accept)) + "</span>" +
           '<span class="graph-list-model">模型：' + esc(modelLabel(task.model)) + "</span>" +
           (deps.length ? '<span class="graph-list-deps">依赖：' + esc(deps.join("、")) + "</span>" : "") +
           "</li>";
@@ -326,6 +338,8 @@
     mount: mount,
     statusLabel: statusLabel,
     acceptanceLabel: acceptanceLabel,
+    reviewLabel: reviewLabel,
+    acceptLabel: acceptLabel,
     modelLabel: modelLabel,
     badgeClass: badgeClass,
     prettyTime: prettyTime,
