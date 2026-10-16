@@ -893,7 +893,12 @@ def reviewability(attempt_dir, state, result=None, stable=None):
     first(not result.get("base_commit"), "artifacts_incomplete")
     first(not isinstance(state.get("result_sha256"), str), "artifacts_incomplete")
     for change in result.get("changes") or []:
-        first(not change.get("before_sha256") or not change.get("after_sha256"), "artifacts_incomplete")
+        # before_sha256 为 null 表示"这个文件之前不存在"（新建），是合法证据，不是缺证据。
+        # 只有 after_sha256 缺失才算 artifacts_incomplete（否则新建文件的任务永远不可审）。
+        if "before_sha256" in change and change.get("before_sha256") is not None \
+                and not isinstance(change.get("before_sha256"), str):
+            first(True, "artifacts_incomplete")
+        first(not change.get("after_sha256"), "artifacts_incomplete")
     if stable is None:
         stable = stable_result(attempt_dir, state)
     first(stable is not True, "file_unstable")
