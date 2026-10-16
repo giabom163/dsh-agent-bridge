@@ -9,7 +9,7 @@ function prettyTime(value) {
   const date = new Date(value);
   return Number.isNaN(date.valueOf()) ? "—" : date.toLocaleString("zh-CN", {month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit",hour12:false});
 }
-const FALLBACK_STATUS = {ready:"待规划",prepared:"空会话待确认",running:"执行中",awaiting_review:"待审查",awaiting_user:"待用户验收",accepted:"已接收",rework:"返修待规划",failed:"失败",cancelled:"已取消",stop_unconfirmed:"停止未确认",cancel_requested:"取消中"};
+const FALLBACK_STATUS = {ready:"待规划",prepared:"空会话待确认",running:"执行中",awaiting_review:"待审查",awaiting_user:"待用户验收",accepted:"成功",rework:"返修待规划",failed:"失败",cancelled:"作废",stop_unconfirmed:"停止未确认",cancel_requested:"取消中"};
 function labelStatus(value) {
   if (window.BridgeTaskGraph) return window.BridgeTaskGraph.statusLabel(value);
   if (value === null || value === undefined || value === "") return "未知";
@@ -37,6 +37,10 @@ async function api(path, options = {}) {
 async function refresh(keep = true) {
   try {
     const data = await api("/api/tasks"); state.tasks = data.tasks || [];
+    // 已经确认成功（accepted）和已经作废（cancelled）的任务沉到最下面：它们不再需要动作。
+    const sunk = row => ["accepted", "cancelled"].includes(row.state && row.state.status) ? 1 : 0;
+    const stamp = row => Date.parse((row.state && (row.state.finished_at || row.state.started_at || row.state.created_at)) || "") || 0;
+    state.tasks.sort((a, b) => (sunk(a) - sunk(b)) || (stamp(b) - stamp(a)));
     state.connected = true; state.hasLoadedTasks = true; state.lastSuccessAt = new Date().toISOString();
     $("taskCount").textContent = state.tasks.length;
     renderMetrics(); renderRows();
@@ -127,7 +131,7 @@ function renderRows() {
   $("emptyTitle").textContent = unknown ? "无法读取任务" : "还没有任务";
   $("emptyHint").textContent = unknown ? "尚未成功加载任务列表；无法确认任务是否为空。请等待重试或检查本机连接。" : "创建任务契约后，可在这里规划、执行和审查。";
   $("emptyNewButton").hidden = unknown;
-  $("taskRows").innerHTML = rows.map(row => `<tr class="task-row ${state.selected === row.task_id ? "selected" : ""}" data-id="${esc(row.task_id)}"><td><div class="task-title">${esc(row.task.title || row.task.goal)}</div><div class="task-id">${esc(row.task_id)} · r${esc(row.state.revision)}</div></td><td><span class="executor">${esc(row.task.executor)}</span></td><td><span class="badge ${esc(row.state.status)}">${esc(labelStatus(row.state.status))}</span></td><td class="update-time">${esc(prettyTime(row.state.finished_at || row.state.started_at || row.state.created_at))}</td><td class="row-open">›</td></tr>`).join("");
+  $("taskRows").innerHTML = rows.map(row => `<tr class="task-row ${["accepted", "cancelled"].includes(row.state.status) ? "sunk" : ""} ${state.selected === row.task_id ? "selected" : ""}" data-id="${esc(row.task_id)}"><td><div class="task-title">${esc(row.task.title || row.task.goal)}</div><div class="task-id">${esc(row.task_id)} · r${esc(row.state.revision)}</div></td><td><span class="executor">${esc(row.task.executor)}</span></td><td><span class="badge ${esc(row.state.status)}">${esc(labelStatus(row.state.status))}</span></td><td class="update-time">${esc(prettyTime(row.state.finished_at || row.state.started_at || row.state.created_at))}</td><td class="row-open">›</td></tr>`).join("");
   document.querySelectorAll(".task-row").forEach(el => el.addEventListener("click", () => selectTask(el.dataset.id)));
 }
 function placeholder() { return `<div class="detail-placeholder"><div class="placeholder-art"><i></i><i></i><i></i></div><strong>选择一个任务</strong><span>计划、执行结果和审查记录会显示在这里。</span></div>`; }

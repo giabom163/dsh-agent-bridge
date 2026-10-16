@@ -72,3 +72,7 @@
 .tl-label i{display:inline;font-style:normal;font-size:10px;color:#9aa5a0}
 .tl-track{width:100%}
 .tl-meta{margin-top:3px}
+
+/* 成功 / 作废的任务沉底并淡显：它们不再需要动作。 */
+.task-row.sunk{opacity:.55}
+.task-row.sunk .task-title{font-weight:500}

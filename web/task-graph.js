@@ -17,10 +17,10 @@
     running: "执行中",
     awaiting_review: "待审查",
     awaiting_user: "待用户验收",
-    accepted: "已接收",
+    accepted: "成功",
     rework: "返修待规划",
     failed: "失败",
-    cancelled: "已取消",
+    cancelled: "作废",
     stop_unconfirmed: "停止未确认"
   };
   // 桥取消 API 的临时过程标签，不属于契约 10 状态，单独保留。
