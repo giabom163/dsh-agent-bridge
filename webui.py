@@ -80,7 +80,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
-        self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:")
+        # style-src 允许 inline：Cytoscape 会注入一个 <style> 元素（style-src-elem），实测被拦。
+        # 本控制台仅回环、Host/Origin 强校验、静态资源白名单、无用户 HTML 注入，故只对样式放宽，脚本仍限 'self'。
+        self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:")
         self.end_headers()
         self.wfile.write(body)
 

@@ -65,3 +65,10 @@
 .tl-meta{font:500 11px 'DM Mono',monospace;color:#66716c}
 .tl-axis{display:flex;justify-content:space-between;font:500 10px 'DM Mono',monospace;color:#9aa5a0;margin-top:6px}
 .tl-back{margin-top:10px;border:1px dashed #b7ddc6;background:#f1f9f4;border-radius:9px;padding:7px 10px;font-size:12px;color:#1f6b4c}
+
+/* 时间线：详情面板可能只有 ~400px 宽，grid 的 1fr 轨道会被挤成 0；改纵向块布局，轨道永远满宽。 */
+.tl-row{display:block}
+.tl-label{display:flex;flex-wrap:wrap;gap:8px;align-items:baseline;margin-bottom:4px}
+.tl-label i{display:inline;font-style:normal;font-size:10px;color:#9aa5a0}
+.tl-track{width:100%}
+.tl-meta{margin-top:3px}

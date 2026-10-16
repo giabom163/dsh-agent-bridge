@@ -219,11 +219,13 @@ function flowHtml(s, data) {
   const branchLabels = {failed: "执行失败", stop_unconfirmed: "停止未确认", rework: "返修待规划", cancelled: "已取消", cancel_requested: "取消中"};
   const branch = branchLabels[s.status] || null;
   const index = chain.findIndex(([key]) => key === s.status);
+  // 分支状态（失败/取消/停止未确认/返修）在链上没有 current：按证据把走过的那几步标成 done，别整条都灰。
+  const reached = index >= 0 ? index : (s.current_attempt ? 2 : 0);
   const nodes = chain.map(([, label], i) => {
-    const cls = i === index ? "node current" : (index >= 0 && i < index) ? "node done" : "node";
+    const cls = i === index ? "node current" : (i <= reached ? "node done" : "node");
     return `<div class="${cls}"><span>${esc(label)}</span></div>`;
   }).join('<i class="arrow">→</i>');
-  const hang = branch ? `<div class="flow-hang"><i class="arrow">↳</i><div class="node bad"><span>${esc(branch)}</span></div></div>` : "";
+  const hang = branch ? `<div class="flow-hang"><i class="arrow">↳</i><div class="node bad branch"><span>${esc(branch)}</span></div></div>` : "";
   const chips = [
     chip("尝试", s.current_attempt ? s.current_attempt.slice(-8) : "无"),
     chip("修订", "r" + String(s.revision)),
