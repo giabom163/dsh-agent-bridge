@@ -994,6 +994,55 @@ def review(store, task_id, decision, audit, user, verdict="blocked", review_inpu
     return state
 
 
+def backfill(store, task_id, approved):
+    """§4.2 存量回填：只补 execution_facts / reviewable / review_gate。
+
+    绝不改 acceptance、status、review_evidence，也不倒推结论；写前把 result.json 与 state.json
+    各备份为 *.bak-<epoch-ms>。result.json 字节会变，因此必须同步 state.result_sha256，
+    否则后续 review() 会按"结果文件被改写"拒绝（这不是改验收或状态，是保持登记一致）。
+    """
+    if not approved:
+        raise ValueError("回填会写历史产物；需 --approve-backfill")
+    directory = task_dir(store, task_id)
+    with writer(store):
+        task, state = load_task(directory)
+        attempt_id = state.get("current_attempt")
+        if not attempt_id:
+            return {"task_id": task_id, "changed": False, "note": "没有当前尝试，无法派生可审准入"}
+        attempt_dir = directory / "attempts" / attempt_id
+        path = attempt_dir / "result.json"
+        if not path.is_file():
+            return {"task_id": task_id, "attempt_id": attempt_id, "changed": False, "note": "当前尝试没有 result.json"}
+        result = read(path)
+        if isinstance(result.get("execution_facts"), dict) and isinstance(result.get("review_gate"), dict):
+            return {"task_id": task_id, "attempt_id": attempt_id, "changed": False,
+                    "review_gate": result["review_gate"], "note": "已有四轴字段，未改动"}
+        keep = {key: state.get(key) for key in ("status", "acceptance", "review_evidence")}
+        gate = reviewability(attempt_dir, state, result=result)
+        stamp = int(time.time() * 1000)
+        backups = []
+        for target in (path, directory / "state.json"):
+            backup = target.with_name(target.name + ".bak-" + str(stamp))
+            backup.write_bytes(target.read_bytes())
+            backups.append(str(backup))
+        result["execution_facts"] = execution_facts(result)
+        result["reviewable"] = gate["reviewable"]
+        result["review_gate"] = gate
+        atomic(path, result)
+        state["result_sha256"] = digest(path.read_bytes())
+        state["reviewable"] = gate["reviewable"]
+        state["review_gate"] = gate
+        state["execution_facts"] = result["execution_facts"]
+        state["backfilled_at"] = now()
+        assert all(state.get(key) == value for key, value in keep.items()), "回填不得改动 status/acceptance/review_evidence"
+        atomic(directory / "state.json", state)
+        event(directory, "backfilled", attempt_id=attempt_id, review_gate=gate, backups=backups)
+        return {"task_id": task_id, "attempt_id": attempt_id, "changed": True,
+                "reviewable": gate["reviewable"], "review_gate": gate,
+                "execution_facts": result["execution_facts"], "backups": backups,
+                "untouched": keep}
+
+
 def revise(store, task_id, source):
     directory = task_dir(store, task_id)
     replacement = validate(read(source))
@@ -1058,6 +1107,10 @@ def main():
     subs = parser.add_subparsers(dest="command", required=True)
     subs.add_parser("doctor")
     p = subs.add_parser("submit"); p.add_argument("contract", type=Path)
+    p = subs.add_parser("backfill")
+    p.add_argument("task_id", nargs="?")
+    p.add_argument("--all", dest="all_tasks", action="store_true", help="对 store 内全部任务回填")
+    p.add_argument("--approve-backfill", action="store_true", help="确认会写历史 result/state（含逐文件备份）")
     for name in ("plan", "status", "prepare", "run", "cancel", "review", "revise"):
         p = subs.add_parser(name); p.add_argument("task_id")
         if name in ("prepare", "run"):
@@ -1092,6 +1145,16 @@ def main():
     elif args.command in ("prepare", "run"): result = run(store, args.task_id, config, args.plan_sha256, args.approve_start, args.ack_unmetered, args.command == "prepare", args.confirm_visible)
     elif args.command == "cancel": result = cancel(store, args.task_id, args.attempt_id, args.approve_cancel)
     elif args.command == "review": result = review(store, args.task_id, args.decision, args.audit_evidence, args.user_evidence, args.verdict, args.review_input)
+    elif args.command == "backfill":
+        if args.all_tasks:
+            tasks_dir = store / "tasks"
+            targets = sorted(p.name for p in tasks_dir.iterdir() if (p / "state.json").is_file()) if tasks_dir.is_dir() else []
+            result = {"store": str(store), "approved": bool(args.approve_backfill),
+                      "tasks": {name: backfill(store, name, args.approve_backfill) for name in targets}}
+        elif args.task_id:
+            result = backfill(store, args.task_id, args.approve_backfill)
+        else:
+            parser.error("backfill 需要 task_id 或 --all")
     else: result = revise(store, args.task_id, args.contract)
     print(scrub(json.dumps(result, ensure_ascii=False, indent=2)))
     return exit_code_for(result)

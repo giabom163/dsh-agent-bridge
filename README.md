@@ -65,7 +65,7 @@ doctor 只查看入口是否存在，不启动模型、服务或 UI。所有操�
 - 字段语义（`schemas/task.schema.json` 的 `description`，仅注解）：`allowed_paths` 是**可修改范围**（仓库相对路径或以 `/` 结尾的目录前缀），`artifacts` 是**必须交付的产物**且必须落在 `allowed_paths` 内；`input_refs` 是需固定 hash 的已跟踪输入文件；`completion_criteria` 供人工/只读审计核对，不替代机器证据。
 - 可选 `anchors`：`相对路径:行[,行|起-止]`（如 `web/task-graph.js:147,184,251-253`）。路径须是仓库相对路径，行号为正整数或正序区间；锚点文件必须同时列入 `input_refs` 以随输入固定 hash。越界行、反向区间、非正整数或未列入 `input_refs` 的锚点会被拒；旧契约没有该字段继续兼容。
 - 提示词把完整 task JSON 只内联一次，不再逐字复述 `goal`／`allowed_paths`／`completion_criteria`／`artifacts`，也不复述时限或 anchors；并内联真实 `attempt.worktree` 与基线 `base_commit`。提示词中的工作区是真实 attempt 工作区，不是桥任务 store 目录。
-- 提示词**默认不执行测试/服务/桌面**，但契约明确授权的有限语法或定向检查（如 `node --check`、内存 `compile`）可执行，不擅自扩大；并分行说明 `allowed_paths`/`artifacts` 语义、进度（NOT_STARTED/READY/RUNNING/DONE/BLOCKED）与验收（PASS/FAIL/BLOCKED）是两套独立字段、执行者不得自动判定人工 accept，允许阅读工作区源码或在缺证据时报告阻塞。
+- 提示词**默认不执行测试/服务/桌面**，但契约明确授权的有限语法或定向检查（如 `node --check`、内存 `compile`）可执行，不擅自扩大；并分行说明 `allowed_paths`/`artifacts` 语义、进度（NOT_STARTED/READY/RUNNING/DONE/BLOCKED）与验收是两套独立字段（验收自本版起是**四轴**：执行事实 / 可审准入 / 产品意见 / 人工接收；`acceptance` 只取 `BLOCKED` 或 `PASS`）、执行者不得自动判定人工 accept，允许阅读工作区源码或在缺证据时报告阻塞。
 - 协同图节点标签优先显示短 `title`；无 `title` 时用 `task_id` 的尾部并加省略标识（避免公共前缀难区分）。文本列表**无 `title` 时直接显示完整 `task_id`**，并保留 `title` 属性；点击详情完整显示。
 
 `tests/prompt_checks.py --limit 3` 提供三组不调用模型、不联网的定向检查：prompt 单次内联、真实工作区/基线与上述包装语义、anchors 与 artifacts 边界正反例，以及用本机 Node 实际执行标签逻辑核对缺 title 任务的图内尾部标签与文本列表完整 ID。只在用户手动执行时于 `data/` 内创建临时夹具与一次本地 Node 子进程，不启动服务、不自动清理现场。
@@ -101,7 +101,31 @@ cancel 写入请求，运行器处理后才能确认停止；若运行器崩溃�
 
 默认记录在 `data/tasks/<task-id>/`：契约版本、state.json、events.jsonl，以及 attempts 中的工作区、日志、result.json、前后哈希和 diff。工作区默认是 `attempts/<attempt-id>/workspace`；只有该绝对路径 ≥200 字符时才改放短根，`review` 与离线检查一律按 `attempt.json` 记录的真实路径核对，不按固定相对路径猜。新增未跟踪文件由哈希清单和实际文件展示；普通 Git diff 不包含它们。
 
-完成后是 awaiting_review，acceptance 仍为 BLOCKED。退出码非零、缺产物、可观察越界或采集错误会记录 FAIL。DSH 记录原生 sessionId；OpenCode 采集 sessionID 和工具 error 警告。共享会话元数据保存在 native-session.json，发送意图保存在 prompt-intent.json：即使发送失败或中途崩溃也不自动重发。只从原生 session.get 回读 tokens，不估计请求数或费用。任务提示词完整内联契约，不要求读取 worktree 外文件。
+完成后是 awaiting_review；`acceptance` 只表达机器执行安全性，取 `BLOCKED`（未接收）或 `PASS`（已接收），**不再写 FAIL**。执行是否失败改记在 `result.json` 的 `execution_facts`（`exit_code` / `stop_reason` / `native_error_count` / `violations` / `missing_artifacts` / `stop_confirmed` / `timed_out`）；是否适合只读审查记在 `reviewable` + `review_gate`。CLI 退出码由 `exit_code_for()` 决定：执行失败仍返回 1，旧结果继续按 `acceptance == "FAIL"` 判定。DSH 记录原生 sessionId；OpenCode 采集 sessionID 和工具 error 警告。共享会话元数据保存在 native-session.json，发送意图保存在 prompt-intent.json：即使发送失败或中途崩溃也不自动重发。只从原生 session.get 回读 tokens，不估计请求数或费用。任务提示词完整内联契约，不要求读取 worktree 外文件。
+
+### 分账四轴与可审准入
+
+| 轴 | 字段 | 谁写 | 含义 |
+|---|---|---|---|
+| A 执行事实 | `execution_facts` | 运行器 | 发生了什么（退出码、停止原因、原生错误数、越界、缺产物、停稳、是否超时） |
+| B 可审准入 | `reviewable` + `review_gate` | 桥（`reviewability()`，可复算） | 产物是否适合只读审查。`reason` 依序取第一个成立者：`stop_unconfirmed` → `exit_nonzero` → `native_errors` → `violations` → `missing_artifacts` → `artifacts_incomplete` → `file_unstable` |
+| C 产品意见 | `product_review` | `review --decision audit --verdict pass\|fail\|blocked` | 是否符合方案（只读审查结论） |
+| D 人工接收 | `human_accept` | `review --decision accept` | 用户最终接收，须同时附只读审计与用户真实路径证据 |
+
+- **`stop_reason == "timeout"` 不参与可审判定**：仅墙钟超时、其余合规的产物可以进入只读审查（"可审"≠"通过"）。反过来 `stop_confirmed is not True`（停止未确认）仍然硬拒，且该项只对存在原生会话的尝试生效——standalone / DSH 没有原生会话可确认，其停止事实由桥自身进程回收与 `exit_code` 表达。
+- **可审 ≠ 可接收**：`accept` 的机器门（`exit_code == 0`、无越界、无缺产物、无原生错误）一字未放宽。
+- 既有产物的派生视图（**只读、不写任何文件**）：
+
+```powershell
+& $bridgePython -B .\bridge.py --limit 3 --store <store> doctor   # 输出 review_gates：每个任务当前 attempt 的 review_gate + execution_facts
+```
+
+- 存量回填（**会写历史 result/state**，写前逐文件备份为 `*.bak-<epoch-ms>`；只补 `execution_facts` / `reviewable` / `review_gate`，绝不改 `acceptance` / `status` / `review_evidence`，也不倒推结论）：
+
+```powershell
+& $bridgePython -B .\bridge.py --limit 3 --store <store> backfill <task-id> --approve-backfill
+& $bridgePython -B .\bridge.py --limit 3 --store <store> backfill --all --approve-backfill
+```
 
 有修改意见，将原契约复制为有实际修改的新版本，保持 task_id，手动调用：
 
@@ -115,9 +139,11 @@ cancel 写入请求，运行器处理后才能确认停止；若运行器崩溃�
 只读审计形成非空证据文件，用户通过真实客户端验证后提供自己的证据文件。人工接收：
 
 ```powershell
-& $bridgePython -B .\bridge.py --limit 3 review daily-source --decision audit --audit-evidence .\audit.md
+& $bridgePython -B .\bridge.py --limit 3 review daily-source --decision audit --verdict pass --audit-evidence .\audit.md
 & $bridgePython -B .\bridge.py --limit 3 review daily-source --decision accept --audit-evidence .\audit.md --user-evidence .\user-evidence.md
 ```
+
+`--verdict` 只用于 `audit`（写入 `product_review`，取值 `pass` / `fail` / `blocked`，缺省 `blocked`）。可选 `--review-input <json>` 引用另一个已停稳的产物作为审查输入：桥会核对 task/attempt 存在、`result_sha256` 与实际字节一致、`stop_confirmed` 为真、以及所列 artifacts 的字节哈希。
 
 桥核对退出状态、结果哈希、工作区是否又变动、证据文件及哈希，然后保存人工接收决定；不会判断两个任意文件就足以证明真实验收。证据内容须由独立只读审计和用户确认。接收不自动合并、不提交、不删除 worktree。
 
