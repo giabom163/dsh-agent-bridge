@@ -170,13 +170,20 @@ class BridgeHandler(BaseHTTPRequestHandler):
                                              "text": str(part.get("text") or item.get("error") or "")[-4000:]})
                     except (ValueError, AttributeError, TypeError):
                         continue
+            # 详情页的准入用**实时复算**：state.json 里存的是采集当时的值，代码修好后二者会不一致
+            # （发生过：新建文件被误判 artifacts_incomplete）。复算失败就退回存量值并标注来源。
+            try:
+                live = bridge.reviewability(attempt, state, result=result)
+                state = {**state, "review_gate": live, "reviewable": live["reviewable"],
+                         "review_gate_source": "live"}
+            except Exception:
+                state = {**state, "review_gate_source": "stored"}
         with self.server.jobs_lock:
             job = self.server.jobs.get(task_id)
         return {"task": task, "state": state, "result": result, "job": job,
                 "native": native, "native_observation": observation, "attempt": attempt_info,
                 "activity": activity[-12:], "commands": self._commands(task_id),
                 "paths": self._paths(task_id, state), "attempts": self._attempts(directory)}
-
     def _commands(self, task_id):
         """把常用 CLI 命令下发到界面，省掉另开命令行窗口。"""
         base = '& "%s" -B "%s" --limit 3 --store "%s"' % (sys.executable, ARCHIVE, self.server.store)
@@ -372,8 +379,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
             if action == "review":
                 directory = bridge.task_dir(self.server.store, task_id)
                 decision = body.get("decision")
-                if decision not in ("audit", "accept", "reject", "dismiss"):
-                    raise ValueError("decision 只支持 audit / accept / reject / dismiss")
+                if decision not in ("audit", "accept", "reject", "dismiss", "void"):
+                    raise ValueError("decision 只支持 audit / accept / reject / dismiss / void")
                 audit = self._save_evidence(directory, "audit", body.get("audit_evidence")) if body.get("audit_evidence") else None
                 if decision == "audit" and audit is None:
                     raise ValueError("审计阶段需要只读审查证据")

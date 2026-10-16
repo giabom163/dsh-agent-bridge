@@ -148,8 +148,10 @@ function actionButtons(data) {
   const dismissButton = (data.state.human_accept && data.state.human_accept.decision === "reject")
     ? `<button class="secondary-button small-button" data-action="dismiss">撤销打回</button>` : "";
   const reviseButton = !["running","prepared","stop_unconfirmed","accepted"].includes(s) ? `<button class="secondary-button small-button" data-action="revise">修订契约</button>` : "";
+  const voidButton = !["running", "prepared", "cancel_requested", "cancelled"].includes(s)
+    ? `<button class="secondary-button small-button" data-action="void">作废</button>` : "";
   const nativeButton = data.native ? `<button class="secondary-button small-button" data-action="native-status">回读原生状态</button>` : "";
-  return planButton + prepareButton + runButton + nativeButton + cancelButton + auditButton + acceptButton + rejectButton + dismissButton + reviseButton;
+  return planButton + prepareButton + runButton + nativeButton + cancelButton + auditButton + acceptButton + rejectButton + dismissButton + reviseButton + voidButton;
 }
 async function selectTask(id) {
   state.selected = id; renderRows();
@@ -236,7 +238,7 @@ function flowHtml(s, data) {
     chip("开始", s.started_at ? prettyTime(s.started_at) : "未开始"),
     chip("结束", s.finished_at ? prettyTime(s.finished_at) : "未结束"),
     chip("验收", labelAcceptance(s.acceptance), s.acceptance === "PASS" ? "ok" : ""),
-    s.review_gate ? chip("可审", s.review_gate.reviewable ? "可审" : (s.review_gate.reason || "不可审"), s.review_gate.reviewable ? "ok" : "bad") : "",
+    s.review_gate ? chip("可审", (s.review_gate.reviewable ? "可审" : (s.review_gate.reason || "不可审")) + (s.review_gate_source === "live" ? "（实时）" : "（存量）"), s.review_gate.reviewable ? "ok" : "bad") : "",
   ].filter(Boolean).join("");
   return `<div class="flow">${nodes}</div>${hang}<div class="chips">${chips}</div>${timelineHtml(s, data)}
     <p class="detail-subtle">流程来自桥本地记录：规划 → 准备（shared 需客户端确认可见）→ 执行 → 回收 → 可审准入 → 只读审查（产品意见）→ 人工接收（接收 / 打回）。分支节点表示当前尝试停在哪一步外侧。</p>`;
@@ -351,6 +353,7 @@ async function handleAction(action, data) {
   if (action === "accept") openReviewDialog(data, "accept");
   if (action === "reject") openReviewDialog(data, "reject");
   if (action === "dismiss") openReviewDialog(data, "dismiss");
+  if (action === "void") openReviewDialog(data, "void");
 }
 function openTaskDialog(task = null) {
   state.editTask = task;
@@ -386,6 +389,7 @@ function updateActionReady() {
   else if(c.type==="accept") ready=$("auditFile").files.length===1 && $("userFile").files.length===1 && $("confirmAccept").checked;
   else if(c.type==="reject") ready=$("auditFile").files.length===1 && $("confirmReject").checked && $("rejectReason").value.trim().length>0;
   else if(c.type==="dismiss") ready=$("dismissReason").value.trim().length>0;
+  else if(c.type==="void") ready=$("voidReason").value.trim().length>0;
   $("confirmActionButton").disabled=!ready;
 }
 function openRunDialog(data, action = "run") {
@@ -400,7 +404,7 @@ function openCancelDialog(data) {
   openAction("中断此任务","取消批准",`<div class="warning-box">共享模式会向此会话发送原生 interrupt，并结束桥的观察进程；不会关闭 OpenCode 服务。私有模式结束该任务进程树。必须回读原生状态确认停稳；现场保留。</div><div class="info-box"><strong>任务：</strong>${esc(id)}<br><strong>当前 attempt：</strong>${esc(attempt)}</div><label><input type="checkbox" id="approveCancel">我批准中断此 attempt</label><label>输入 <strong>CANCEL ${esc(id)}</strong> 确认<input type="text" id="confirmPhrase" autocomplete="off"></label>`,"请求取消",{type:"cancel",id,attempt});
 }
 function openReviewDialog(data, decision) {
-  const accept = decision === "accept", reject = decision === "reject", dismiss = decision === "dismiss";
+  const accept = decision === "accept", reject = decision === "reject", dismiss = decision === "dismiss", isVoid = decision === "void";
   const fileInput = (id, label) => `<label>${label}<input type="file" id="${id}" accept=".md,.txt,.json,.log,.png,.jpg,.jpeg"></label>`;
   const reasonBox = (id, label) => `<label>${label}<textarea id="${id}" rows="3" autocomplete="off"></textarea></label>`;
   const verdicts = `<fieldset class="verdict"><legend>产品意见</legend>
@@ -410,15 +414,17 @@ function openReviewDialog(data, decision) {
   const hint = accept ? "接收要求只读审查证据和用户真实路径证据同时提供；机器门（退出码 / 越界 / 缺产物 / 原生错误）一字不放宽。"
     : reject ? "打回会把任务退回 rework（可改契约后重跑），不改历史产物、不自动重跑、不删除现场。至少附只读审计证据。"
     : dismiss ? "撤销打回只对「已被人工打回」的任务生效；必须填理由（写进 revisions 账），任务回到「待接收」，可重新审查。"
+    : isVoid ? "作废是把「已结束但没有价值」的任务冻结掉：状态转「作废」并沉到列表最下面，不改历史产物、不删证据、不自动重跑。必须填理由。"
     : "此处只记录只读审查与产品意见；验收仍是 BLOCKED，之后还需要你的真实路径证据。";
   const html = `<div class="info-box">证据文件会复制到任务目录 <code>web-evidence</code> 并保留。${hint}</div>`
-    + (dismiss ? "" : fileInput("auditFile", "只读审查证据"))
+    + (dismiss || isVoid ? "" : fileInput("auditFile", "只读审查证据"))
     + (accept ? verdicts + fileInput("userFile", "用户真实路径证据") + `<label><input type="checkbox" id="confirmAccept">我确认所选证据对应真实客户端路径及本任务</label>` : "")
     + (reject ? fileInput("userFile", "补充证据（可选）") + reasonBox("rejectReason", "打回理由（必填；会记进 human_accept.reason，供下一次修订使用）") + `<label><input type="checkbox" id="confirmReject">我确认打回此任务的当前产物</label>` : "")
-    + (dismiss ? reasonBox("dismissReason", "撤销理由（必填；会记进 revisions 账）") : "");
-  const title = accept ? "提交验收证据" : reject ? "打回任务" : dismiss ? "撤销打回" : "记录只读审查";
-  const eyebrow = accept ? "人工接收" : reject ? "人工打回" : dismiss ? "撤销判定" : "只读审查";
-  const confirmText = accept ? "审查并接收" : reject ? "确认打回" : dismiss ? "确认撤销" : "提交审查";
+    + (dismiss ? reasonBox("dismissReason", "撤销理由（必填；会记进 revisions 账）") : "")
+    + (isVoid ? reasonBox("voidReason", "作废理由（必填；会记进 void 账，含作废前的状态）") : "");
+  const title = accept ? "提交验收证据" : reject ? "打回任务" : dismiss ? "撤销打回" : isVoid ? "作废任务" : "记录只读审查";
+  const eyebrow = accept ? "人工接收" : reject ? "人工打回" : dismiss ? "撤销判定" : isVoid ? "人工作废" : "只读审查";
+  const confirmText = accept ? "审查并接收" : reject ? "确认打回" : dismiss ? "确认撤销" : isVoid ? "确认作废" : "提交审查";
   openAction(title, eyebrow, html, confirmText, {type: decision, id: data.task.task_id});
 }
 async function evidenceFile(inputId) {
@@ -435,15 +441,16 @@ $("confirmActionButton").addEventListener("click", async () => {
     else if(c.type==="cancel") data=await api(`/api/tasks/${c.id}/cancel`,{method:"POST",body:JSON.stringify({attempt_id:c.attempt,approve_cancel:true})});
     else {
       const body={decision:c.type};
-      if(c.type!=="dismiss")body.audit_evidence=await evidenceFile("auditFile");
+      if(c.type!=="dismiss" && c.type!=="void")body.audit_evidence=await evidenceFile("auditFile");
       if(c.type==="accept")body.user_evidence=await evidenceFile("userFile");
       if(c.type==="reject" && $("userFile").files.length===1)body.user_evidence=await evidenceFile("userFile");
       if(c.type==="reject")body.reason=$("rejectReason").value.trim();
       if(c.type==="dismiss")body.reason=$("dismissReason").value.trim();
+      if(c.type==="void")body.reason=$("voidReason").value.trim();
       if(c.type==="audit"){const picked=document.querySelector('input[name="verdict"]:checked');body.verdict=picked?picked.value:"blocked";}
       data=await api(`/api/tasks/${c.id}/review`,{method:"POST",body:JSON.stringify(body)});
     }
-    $("actionDialog").close(); toast(c.type==="prepare"?"正在创建空会话；不会发送提示词。":c.type==="run"?"提示词执行已提交；请查看原生会话。":c.type==="cancel"?"取消请求已记录；请核对停止状态。":c.type==="reject"?"打回已记录：任务回到 rework，可改契约后重跑。":c.type==="dismiss"?"撤销打回已记录：任务回到待接收。":"审查记录已提交。 ");
+    $("actionDialog").close(); toast(c.type==="prepare"?"正在创建空会话；不会发送提示词。":c.type==="run"?"提示词执行已提交；请查看原生会话。":c.type==="cancel"?"取消请求已记录；请核对停止状态。":c.type==="reject"?"打回已记录：任务回到 rework，可改契约后重跑。":c.type==="dismiss"?"撤销打回已记录：任务回到待接收。":c.type==="void"?"作废已记录：任务沉底并冻结。":"审查记录已提交。 ");
     if(c.type==="run")await new Promise(resolve=>setTimeout(resolve,350)); await refresh();
   } catch(error) { $("actionError").textContent=error.message; $("confirmActionButton").disabled=false; }
 });
