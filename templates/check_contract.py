@@ -33,6 +33,8 @@ def main():
     ap.add_argument("--max-files", type=int, default=2)
     ap.add_argument("--max-artifacts", type=int, default=3)
     ap.add_argument("--max-timeout", type=int, default=900)
+    ap.add_argument("--max-goal-chars", type=int, default=4000, help="goal 字符上限（防命令行过长）")
+    ap.add_argument("--max-bytes", type=int, default=20000, help="契约文件字节上限")
     args = ap.parse_args()
 
     p = pathlib.Path(args.path)
@@ -91,6 +93,20 @@ def main():
                    "detail": {"count": len(crit)}})
     if len(crit) < 3:
         warnings.append("completion_criteria 少于 3 条")
+
+    # 载荷体积门：预防 Windows 命令行过长（WinError 206）与审查方超时。
+    # 实测事故：R0 审查第 2 轮因内联输入过长，进程 2 秒就死在 CreateProcess。
+    goal_chars = len(goal)
+    packet_bytes = len(raw)
+    checks.append({"id": "payload_size",
+                   "ok": goal_chars <= args.max_goal_chars and packet_bytes <= args.max_bytes,
+                   "detail": {"goal_chars": goal_chars, "max_goal_chars": args.max_goal_chars,
+                              "contract_bytes": packet_bytes, "max_bytes": args.max_bytes}})
+    if goal_chars > args.max_goal_chars:
+        problems.append(f"goal 长 {goal_chars} 字符 > 上限 {args.max_goal_chars}："
+                        "派发/审查时极可能触发 Windows 命令行过长或审查超时；请把细节移到 docs/ 与证据文件，goal 只留契约要点")
+    if packet_bytes > args.max_bytes:
+        problems.append(f"契约文件 {packet_bytes} 字节 > 上限 {args.max_bytes}：同上")
 
     verdict = "fail" if problems else ("warn" if warnings else "pass")
     print(json.dumps({"path": str(p), "template": is_template, "verdict": verdict,
