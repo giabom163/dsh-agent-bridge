@@ -540,6 +540,15 @@ def execute_attempt(directory, task, state, config, expected, attempt_dir, attem
         native_errors = []
         session_id = native["session_id"] if native else None
         native_warnings = []
+        # service 模式探测不到本机 opencode 后台服务时会静默回落 standalone（每任务多付约 1.2s）。
+        # 这里把回落显式记成警告与事件，避免“桥变慢了却查不到原因”。
+        if (task.get("executor") == "opencode" and task.get("opencode_mode", "service") == "service"
+                and "--standalone" in command):
+            native_warnings.append({
+                "stage": "mode",
+                "message": "opencode_mode=service 但本机后台服务不可用，已回落 --standalone"
+                           "（每任务多付约 1.2s）；执行 `opencode service start` 可恢复"})
+            event(directory, "opencode_service_unavailable", attempt_id=attempt_id)
         stop_confirmed = None
         # 收尾循环确认到的停止结论（succeeded/interrupted/failed）。必须在此初始化：
         # 正常完成路径不会走中断分支，final_outcome 保持 None，落盘不能用它代替本值。
