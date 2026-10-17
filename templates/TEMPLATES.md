@@ -109,3 +109,23 @@ python -B $T/integrate.py --store $S --task <task_id> --repo $R
 **每一步都不许"看过滤后的输出"**：`bridge_call.py` 强制完整打印 stdout/stderr；它的退出码原样透传。
 
 **这轮的实测结果**：`verify_task` 在 S3-B / S1-C v2 上给 `ready_to_review`、在刻意的缺产物样本上给 `needs_fix`（exit 1）；`integrate` 在真仓库的本地克隆上成功提交（`df6757b`）、重跑给 `no_changes`、对未接收任务 `refused`；`check_contract` 对 4 个模板与 2 个真实契约给 pass/warn（无 problems）。
+
+## 8 工具清单（v2，2026-10-17）
+
+| 工具 | 一句话 | 默认安全行为 |
+|---|---|---|
+| `preflight.py` | 开工自检：仓库/产品库/冷却账/桥账本/**扩展在线**/**凭据有效性** | 默认只发 1 次模型请求（`--no-credential` 可关） |
+| `selfcheck.py` | 交付前离线自检（端点/适配器/标注器/文档四类） | 0 网络 |
+| `check_contract.py` | submit 前契约体检（包大小/超时/必填/自检要求） | 只读 |
+| `verify_task.py` | 自动验收：执行事实+实时可审+自检+产物哈希 → 一个 verdict | 只读 |
+| `integrate.py` | 自动并入（拷文件+LF+提交+哈希核对） | **只有 accepted+PASS 才动仓库** |
+| `bridge_call.py` | 桥命令包装：完整打印 stdout/stderr/退出码 | 不改账本 |
+| `fixture.py` | 离线夹具：record / serve / check / list | serve 0 外网；错请求 **404**（不兜底） |
+| `prune_stores.py` | 回收失败/取消 attempt 的 worktree | **默认 dry-run**，`--apply` 才删 |
+| `contract_diff.py` | 契约 revision 差异 | 只读 |
+| `cost_report.py` | 成本看板（实测 native_cost + 按费率估算） | 只读 |
+| `PITFALLS.md` | 30 条踩坑清单（症状→原因→修法） | — |
+
+**离线夹具的用法**：`fixture.py record --name X` 录一次真实响应 → `fixture.py serve --port 8799` →
+把模型端点指向 `http://127.0.0.1:8799/v1/chat/completions`。这样"无凭据/无网/平台挂"时也能跑完整路径。
+**前提**：产品侧要支持端点覆盖（如读 `OPENCODE_GO_V1_ENDPOINT`）；没有这个开关时夹具只能验证"解析与归一化"，不能验证真实调用。

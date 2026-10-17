@@ -149,12 +149,70 @@ def check_logins(limit):
     return out
 
 
+def check_credential(repo):
+    """凭据有效性：真发一次 max_tokens=1 的请求（唯一 1 次外网请求）。
+
+    教训：桥任务没有凭据时只能写 BLOCKED（S3-B），所以开工时先确认 key 能用，
+    以免排到"实现完了才发现跑不了真实调用"。
+    """
+    import re
+    import urllib.error
+    import urllib.request
+
+    out = {"id": "model_credential", "ok": False, "detail": {}, "requests": 0}
+    creds_path = Path.home() / ".dsh" / ".credentials.yaml"
+    key = None
+    if creds_path.is_file():
+        try:
+            text = creds_path.read_text(encoding="utf-8", errors="replace")
+            m = re.search(r"OPENCODE_GO_V1_API_KEY\s*:\s*[\"']?([^\s\"']+)", text)
+            key = m.group(1) if m else None
+        except OSError:
+            pass
+    if not key:
+        out["detail"]["why"] = "未找到 OPENCODE_GO_V1_API_KEY（模型任务无法做真实调用，只能靠桩/夹具）"
+        return out
+
+    payload = {"model": "deepseek-v4.1-flash", "max_tokens": 1, "reasoning_effort": "none",
+               "messages": [{"role": "user", "content": "hi"}]}
+    headers = {"content-type": "application/json", "authorization": "Bearer " + key,
+               "user-agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                              "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"),
+               "accept": "application/json", "x-opencode-session": "preflight-check"}
+    req = urllib.request.Request("https://opencode.ai/zen/go/v1/chat/completions",
+                                 data=json.dumps(payload).encode(), headers=headers, method="POST")
+    out["requests"] = 1
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body = json.loads(resp.read().decode("utf-8", "replace"))
+        out["ok"] = bool(body.get("choices"))
+        out["detail"] = {"http": resp.status, "model": body.get("model"),
+                         "usage": body.get("usage")}
+    except urllib.error.HTTPError as exc:
+        excerpt = exc.read().decode("utf-8", "replace")[:200]
+        out["detail"] = {"http": exc.code, "excerpt": excerpt}
+    except Exception as exc:  # noqa: BLE001
+        out["detail"] = {"why": f"{type(exc).__name__}: {str(exc)[:160]}"}
+
+    # 顺带静态核对：适配器里三头是否齐（免得"凭据没问题但代码漏头"）
+    adapter = repo / "analysis.py"
+    if adapter.is_file():
+        try:
+            code = adapter.read_text(encoding="utf-8", errors="replace")
+            out["detail"]["adapter_headers"] = {h: (h in code) for h in
+                                                ("Authorization", "User-Agent", "x-opencode-session")}
+        except OSError:
+            pass
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo", required=True)
     ap.add_argument("--output", default=str(Path(__file__).resolve().parents[0]))
     ap.add_argument("--network", action="store_true", help="逐平台查登录态（会发最多 6 次请求，间隔 25s）")
     ap.add_argument("--skip-doctor", action="store_true")
+    ap.add_argument("--no-credential", action="store_true", help="跳过凭据有效性检查（少发 1 次请求）")
     ap.add_argument("--limit", type=int, default=3)
     args = ap.parse_args()
 
@@ -163,6 +221,8 @@ def main():
     checks = [check_repo(repo), check_db(repo), check_throttle(repo), check_bridge(output)]
     if not args.skip_doctor:
         checks.append(check_doctor())
+    if not args.no_credential:
+        checks.append(check_credential(repo))
     if args.network:
         checks.append(check_logins(args.limit))
 
@@ -176,7 +236,8 @@ def main():
     }[verdict]
     report = {"at": datetime.now(timezone.utc).isoformat(), "repo": str(repo),
               "verdict": verdict, "advice": advice,
-              "checks": checks, "network_requests": 0 if not args.network else len(PLATFORMS)}
+              "checks": checks,
+              "network_requests": sum(int(c.get("requests") or 0) for c in checks)}
     print(json.dumps(report, ensure_ascii=False, indent=1))
     return {"ready": 0, "degraded": 1, "blocked": 2}[verdict]
 
