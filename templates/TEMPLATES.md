@@ -60,3 +60,18 @@ python -B <templates>/selfcheck.py --kind endpoint \
 3. **行尾/BOM**：`.gitattributes eol=lf` 的仓库里，用 Python 写文件会把 `\n` 变成 `\r\n`，导致桥的输入哈希与 worktree 不一致 → 一律用 `write_bytes` 并显式 LF；JSON 契约文件不得带 BOM。
 4. **独立审查要用另一个模型**，并要求它**自己重跑**而不是读我的结论；审查指令里写死"最多 N 次上游请求、间隔 ≥30 s"。
 5. **打回必须带理由**，且写账；我自己的输出过滤器曾把打回的错误吞掉——**改账本状态的命令一律看完整输出**。
+
+## 6 开工自检（preflight.py）
+
+派任务前先跑一次，避免“开工才发现”：
+
+```bash
+python -B "<install>/templates/preflight.py" --repo "<产品仓库>" --output "<产物目录>"         # 0 网络
+python -B "<install>/templates/preflight.py" --repo "<产品仓库>" --output "<产物目录>" --network    # 查 6 平台登录态（间隔 25s）
+```
+
+检查：仓库干净度 / 产品库与数据量 / 冷却账 / 桥账本 / **OpenCLI doctor（扩展是否在线）**。
+
+**实测坑**：`doctor` 里的 `not connected` 也含 `connected` → 判定必须看 `[MISSING]/[FAIL]` 否定标记。
+**实测坑 2**：Windows 控制台默认 gbk → 脚本启动时 `sys.stdout.reconfigure(encoding="utf-8")`，否则打印 `•` 之类直接崩。
+**实测坑 3**：PowerShell 5.1 的 `>` 重定向会写成 **UTF-16**；拿 JSON 结果请用 subprocess 捕获 UTF-8 stdout。
