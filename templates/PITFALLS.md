@@ -43,7 +43,7 @@
 | M2 | `403 error 1010`（Cloudflare） | 缺浏览器风格 `User-Agent` | 三头齐：`Authorization` + 浏览器 `User-Agent` + `x-opencode-session` |
 | M3 | `400 MissingSessionID` | 缺 `x-opencode-session` | 同上 |
 | M4 | 返回不是合法 JSON / 很慢（10s+） | 思考模式把预算烧在推理上 | 请求体加 `reasoning_effort: "none"`（实测 10.8s→3.5s，reasoning 900→0） |
-| M5 | `validate` 失败（引用偏移对不上） | 模型给的 quote 与原文有细微差异 | 用 `text.find(quote)` 求真实位置，找不到再降级（`normalize_output`） |
+| M5 | `validate` 失败（引用 start/end 偏差） | 模型给的 quote 与原文**逐字相同**，但它自算的 start/end 有偏差 | `normalize_output` 用 `text.find(quote)` 把 start/end 改写成真实位置；**找不到就原样交给 validate 硬失败**（绝不放宽「quote 必须是原文逐字子串」） |
 | M6 | 平台适配器报 `BROWSER_CONNECT` | Chrome 没开/扩展没连 | 开工先跑 `preflight.py`；`opencli doctor` 看 `Extension: connected` |
 | M7 | 知乎返回空数组 `[]` | 未登录（`z_c0` cookie 缺失） | `zhihu whoami` 先验；空数组不是"没数据"，可能是未登录 |
 
@@ -55,3 +55,13 @@
 | S2 | 时间恒为 `missing` | 热榜没有发布时间字段 | 不猜；如实标 `time_quality=missing` |
 | S3 | 抖音 `COMMAND_EXEC: Detached while handling command` | 适配器依赖创作者后台会话 | 记为不可用，不入端点表 |
 | S4 | 冷却账被误改后限流失效 | 手工编辑账文件 | 只通过程序写；坏账 fail-closed（v2 已保证） |
+
+## 6 独立复核发现（2026-10-17 补）
+
+| # | 症状 | 原因 | 修法 |
+|---|---|---|---|
+| R1 | 夹具"没凭据也能跑"实际不成立 | 产品的凭据检查在**发送之前**（`analysis.py` L299-301），指向本地也要 key | 显式夹具模式：`OPENCODE_GO_V1_FIXTURE=1`（默认关闭，仅离线回放用） |
+| R2 | 夹具永远 404 | 用**整包 body 的 SHA** 当匹配键，而产品 body（`stream`+system/user messages）与录制手写体永远不同 | 默认按 **messages 子集**匹配，另有 `--match model` / `--match body` |
+| R3 | 一次 404 就吃掉一个模型槽位 | `request_once` 把该槽记成 `uncertain` 并**永久阻塞**（不重发，这是对的） | 先确认夹具能命中（`--match model` 或核对 body）再跑真实链路 |
+| R4 | `prune --apply` 会删掉正在用的 workspace | 保留规则只认 `state.json` 的 `current_attempt`，accepted 任务的旧 attempt 会被删；未知状态落到"全删" | 已重写：**默认什么都不删**；未知状态一律保留并告警；`--protect` 保护指定路径；删除逐条核实 |
+| R5 | 报告里的数字"无据可查" | 只在控制台打印、没落盘 | 生成证据文件（`--save`）并报告里写 sha256；没有落盘证据的一律记"待重验" |

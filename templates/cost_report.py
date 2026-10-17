@@ -60,7 +60,12 @@ def main():
                     cost, tokens = nt.get("cost"), nt.get("tokens")
                 except Exception:  # noqa: BLE001
                     pass
-            secs = (finished - started).total_seconds() if started and finished else None
+            secs = None
+            if started and finished:
+                try:
+                    secs = (finished - started).total_seconds()   # 混用 naive/aware 会 TypeError
+                except TypeError:
+                    secs = None
             rows.append({"store": st.parent.name, "task": task, "attempt": att_dir.name[-12:],
                          "secs": secs, "cost": cost if isinstance(cost, (int, float)) else None,
                          "tokens": tokens})
@@ -79,7 +84,13 @@ def main():
         r["tok_out"] = tok.get("output")
         r["tok_reason"] = tok.get("reasoning")
 
+    measured_usd = sum(r["est_usd"] for r in rows if r["cost"] is not None)
+    estimated_usd = sum(r["est_usd"] for r in rows if r["cost"] is None)
     summary = {"attempts": len(rows), "measured": len(measured),
+               "measured_attempts": sum(1 for r in rows if r["cost"] is not None),
+               "estimated_attempts": sum(1 for r in rows if r["cost"] is None),
+               "measured_usd": round(measured_usd, 6),
+               "estimated_usd": round(estimated_usd, 6),
                "rate_usd_per_sec": round(rate, 8),
                "total_minutes": round(total_secs / 60, 1),
                "total_usd": round(total_usd, 6), "total_cny": round(total_usd * args.cny, 4),
@@ -96,7 +107,10 @@ def main():
     print(f"# 成本看板（{len(rows)} 个 attempt）")
     print()
     print(f"- 实测计量的 attempt：**{len(measured)}** 个；费率反推 = ${rate:.8f}/s（含思考 token）")
-    print(f"- 总时长 **{total_secs/60:.1f} 分钟**；估算合计 **${total_usd:.4f} ≈ ¥{total_usd*args.cny:.2f}**")
+    print(f"- **实测** ${measured_usd:.4f}（{summary['measured_attempts']} 个 attempt 有 native_cost）"
+          f" ｜ **估算** ${estimated_usd:.4f}（{summary['estimated_attempts']} 个，按墙钟 × 实测费率；"
+          f"墙钟含排队/人工等待，偏高）｜ 合计 ${total_usd:.4f} ≈ ¥{total_usd * args.cny:.2f}")
+    print(f"- 总时长 {total_secs/60:.1f} 分钟")
     print()
     print("| 账本 | attempt | 估算(USD) |")
     print("|---|---|---|")

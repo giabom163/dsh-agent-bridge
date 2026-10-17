@@ -124,7 +124,7 @@ python -B $T/integrate.py --store $S --task <task_id> --repo $R
 | `prune_stores.py` | 回收失败/取消 attempt 的 worktree | **默认 dry-run**，`--apply` 才删 |
 | `contract_diff.py` | 契约 revision 差异 | 只读 |
 | `cost_report.py` | 成本看板（实测 native_cost + 按费率估算） | 只读 |
-| `PITFALLS.md` | 30 条踩坑清单（症状→原因→修法） | — |
+| `PITFALLS.md` | 34 条踩坑清单（症状→原因→修法） | — |
 
 **离线夹具的用法**：`fixture.py record --name X` 录一次真实响应 → `fixture.py serve --port 8799` →
 把模型端点指向 `http://127.0.0.1:8799/v1/chat/completions`。这样"无凭据/无网/平台挂"时也能跑完整路径。

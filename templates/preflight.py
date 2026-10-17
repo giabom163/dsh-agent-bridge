@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """开工自检（preflight）：把"开工才发现"的问题提前到 0 成本发现。
 
-默认 **0 网络请求**（只读本地状态）：仓库干净度、产品库与数据量、冷却账、桥账本、OpenCLI 扩展是否在线。
-加 `--network` 才会去逐个平台查登录态（每次间隔 25 秒，最多 6 次）。
+默认 **1 次模型请求**（凭据有效性，`--no-credential` 可关掉 → 0 网络）：仓库干净度、产品库与数据量、
+冷却账、桥账本、OpenCLI 扩展是否在线。加 `--network` 会再逐个平台查登录态（最多 `--limit` 个，间隔 25 秒）。
 
 用法：
   python -B preflight.py --repo <产品仓库> --output <本会话产物目录>
@@ -135,7 +135,9 @@ def check_doctor():
 def check_logins(limit):
     """逐个平台查登录态；每次之间间隔 25 秒，最多 6 次请求。"""
     out = {"id": "platform_logins", "ok": True, "detail": {}, "requests": 0}
-    for site, sub in PLATFORMS:
+    targets = PLATFORMS[:max(1, limit)]          # --limit 真正生效（此前形参未用，永远 6 次）
+    out["detail"]["_limit"] = len(targets)
+    for site, sub in targets:
         code, stdout, stderr = run([NODE, CLI, site, "whoami", "-f", "json"], timeout=90)
         out["requests"] += 1
         text = (stdout + stderr)
@@ -144,7 +146,7 @@ def check_logins(limit):
         if code != 0:
             out["ok"] = False
         import time as _t
-        if out["requests"] < len(PLATFORMS):
+        if out["requests"] < len(targets):
             _t.sleep(25)
     return out
 
@@ -213,7 +215,8 @@ def main():
     ap.add_argument("--network", action="store_true", help="逐平台查登录态（会发最多 6 次请求，间隔 25s）")
     ap.add_argument("--skip-doctor", action="store_true")
     ap.add_argument("--no-credential", action="store_true", help="跳过凭据有效性检查（少发 1 次请求）")
-    ap.add_argument("--limit", type=int, default=3)
+    ap.add_argument("--limit", type=int, default=3, help="--network 时最多查几个平台（默认 3）")
+    ap.add_argument("--save", default=None, help="把完整 JSON 报告写到该路径（留证据用）")
     args = ap.parse_args()
 
     repo = Path(args.repo).resolve()
@@ -238,6 +241,8 @@ def main():
               "verdict": verdict, "advice": advice,
               "checks": checks,
               "network_requests": sum(int(c.get("requests") or 0) for c in checks)}
+    if args.save:
+        Path(args.save).write_text(json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")
     print(json.dumps(report, ensure_ascii=False, indent=1))
     return {"ready": 0, "degraded": 1, "blocked": 2}[verdict]
 
