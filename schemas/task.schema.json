@@ -6,7 +6,7 @@
   "properties": {
     "title": {"type": "string", "minLength": 1, "maxLength": 100,
       "description": "可选短标题（1–100 字符）。图与文本列表优先显示 title；无 title 时文本列表直接显示完整 task_id，图内节点用其后 27 字符加省略标识。"},
-    "opencode_mode": {"enum": ["shared", "standalone"], "description": "新前端默认 shared；旧契约缺省 standalone。先 prepare 再确认可见并 run。"},
+    "opencode_mode": {"enum": ["service", "shared", "standalone"], "description": "缺省 service：复用本机后台服务（省掉每任务 spawn 私有 serve，实测快约 1.2s），后台服务不可用时自动退回 standalone。shared 需先 prepare 创建空会话再确认可见并 run；standalone 每次起私有实例。提示词一律走 stdin。"},
     "task_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$",
       "description": "小写字母／数字／连字符，最多 64 字符；无 title 时文本列表直接显示本完整值。"},
     "goal": {"type": "string", "minLength": 1,

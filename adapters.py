@@ -29,13 +29,18 @@ def build(task, prompt, config):
         if not isinstance(model, str) or not re.fullmatch(r"[\w.-]+/[\w.#+-]+", model):
             raise ValueError("OpenCode 必须明确指定 provider/model；不使用不明默认值")
         args = [str(entry), "run", "--format", "json", "--model", model]
-        if shared(task):
+        mode = task.get("opencode_mode", "service")
+        if mode == "shared":
             native = config.get("native_session")
             if native:
                 local_server(native["server"])
                 args += ["--session", native["session_id"]]
             # plan 只构造命令；真正运行必须先创建并记录原生会话。
             args += ["--title", task.get("title", task["task_id"])]
+        elif mode == "service" and service_ready(config):
+            # 复用本机后台服务：省掉每个任务 spawn 一个私有 serve 的开销
+            # （2026-10-17 实测同一条最小任务：服务模式中位 2603ms vs standalone 3785ms）。
+            pass
         else:
             args += ["--standalone"]
         agent = task.get("agent")
@@ -43,12 +48,22 @@ def build(task, prompt, config):
             if not re.fullmatch(r"[\w.-]+", agent):
                 raise ValueError("非法 Agent 名称")
             args += ["--agent", agent]
-        return args + [prompt], None
+        # 提示词一律走 stdin：argv 有 32767 字符上限，长契约会触发 WinError 206。
+        return args, prompt.encode("utf-8")
     raise ValueError("只支持 dsh / opencode 执行器")
 
 
 def shared(task):
-    return task["executor"] == "opencode" and task.get("opencode_mode", "standalone") == "shared"
+    return task["executor"] == "opencode" and task.get("opencode_mode", "service") == "shared"
+
+
+def service_ready(config):
+    """后台服务是否可用；不可用时由调用方退回 --standalone，绝不假装共享。"""
+    try:
+        service(config)
+        return True
+    except Exception:
+        return False
 
 
 def local_server(value):

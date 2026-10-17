@@ -136,8 +136,8 @@ def validate(task):
         raise ValueError("executor 只支持 dsh / opencode")
     if "title" in task and (not isinstance(task["title"], str) or not 1 <= len(task["title"].strip()) <= 100):
         raise ValueError("title 必须为 1–100 字符的短标题")
-    if task.get("opencode_mode", "standalone") not in ("standalone", "shared"):
-        raise ValueError("opencode_mode 只支持 shared / standalone")
+    if task.get("opencode_mode", "service") not in ("service", "standalone", "shared"):
+        raise ValueError("opencode_mode 只支持 service / shared / standalone")
     if task["executor"] != "opencode" and "opencode_mode" in task:
         raise ValueError("opencode_mode 仅用于 OpenCode")
     for key in ("allowed_paths", "artifacts", "completion_criteria"):
@@ -293,7 +293,7 @@ def plan(store, task_id, config):
               "base_commit": commit, "repo": str(repo), "executor": task["executor"], "model": task.get("model"),
               "inputs": inputs, "allowed_paths": task["allowed_paths"], "timeout_seconds": task["timeout_seconds"],
               "executable_sha256": entry_hashes,
-              "opencode_mode": task.get("opencode_mode", "standalone") if task["executor"] == "opencode" else None,
+              "opencode_mode": task.get("opencode_mode", "service") if task["executor"] == "opencode" else None,
               "title": task.get("title", task_id),
               "effects": ["新增一个 detached Git worktree",
                           "先建共享服务空会话，确认客户端可见后再运行" if adapters.shared(task) else "启动一个新的执行器及其私有子进程",
