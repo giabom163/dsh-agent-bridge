@@ -94,7 +94,7 @@ def main():
             continue
         f = workspace / rel
         disk = sha256(f) if f.is_file() else "（worktree 中不存在）"
-        rows.append(f"| `{rel}` | {ch.get('before_sha256') or '（新建）'} | {disk} |")
+        rows.append(f"| `{rel}` | {ch.get('after_sha256') or '（缺失）'} | {disk} |")
 
     code, diff, err = run(["git", "status", "--porcelain"], cwd=str(workspace))
     code2, diff_text, err2 = run(["git", "diff"], cwd=str(workspace))
@@ -135,7 +135,7 @@ def main():
 
 ## 2 真实改动与哈希
 
-| 文件 | result 记录的 after_sha256 | worktree 磁盘复算 |
+| 文件 | result 记录的 after_sha256 | worktree 磁盘复算（应等于前者） |
 |---|---|---|
 """ + ("\n".join(rows) if rows else "| （result.changes 为空） | | |") + f"""
 
