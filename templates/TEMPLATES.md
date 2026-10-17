@@ -75,3 +75,37 @@ python -B "<install>/templates/preflight.py" --repo "<产品仓库>" --output "<
 **实测坑**：`doctor` 里的 `not connected` 也含 `connected` → 判定必须看 `[MISSING]/[FAIL]` 否定标记。
 **实测坑 2**：Windows 控制台默认 gbk → 脚本启动时 `sys.stdout.reconfigure(encoding="utf-8")`，否则打印 `•` 之类直接崩。
 **实测坑 3**：PowerShell 5.1 的 `>` 重定向会写成 **UTF-16**；拿 JSON 结果请用 subprocess 捕获 UTF-8 stdout。
+
+## 7 全流程一条龙（我这边按这个顺序走，每步一条命令）
+
+```bash
+T=<templates 绝对路径>; S=<store>; R=<产品仓库>; B=<产物目录>
+
+# 0) 开工自检（先确认 Chrome/扩展在线）
+python -B $T/preflight.py --repo $R --output $B
+
+# 1) 写契约：复制模板 → 填占位符 → 体检（包太大/漏字段/无自检会被拦）
+python -B $T/check_contract.py <contract.json>          # pass 才继续
+
+# 2) 提交与计划（桥 CLI）
+python -B $T/bridge_call.py --store $S --json-summary -- submit <contract.json>
+python -B $T/bridge_call.py --store $S --json-summary -- plan <task_id>
+
+# 3) 跑（standalone，需 --approve-start --ack-unmetered）
+python -B $T/bridge_call.py --store $S --json-summary -- run <task_id> --plan-sha256 <sha> --approve-start --ack-unmetered
+
+# 4) 自动验收（1 条命令替代"读 result + 调 status + 跑自检 + 算哈希"）
+python -B $T/verify_task.py --store $S --task <task_id> --kind <endpoint|adapter|annotator|docs>
+#    verdict=ready_to_review 才往下一步；needs_fix 按 blockers 修
+
+# 5) 独立模型审查 →（审查结论落成审计文件）→ 登记产品意见 + 接收
+python -B $T/bridge_call.py --store $S --json-summary -- review <task_id> --decision audit --verdict pass --audit-evidence <审计文件>
+python -B $T/bridge_call.py --store $S --json-summary -- review <task_id> --decision accept --audit-evidence <审计文件> --user-evidence <用户接收益据>
+
+# 6) 自动并入（只有 accepted + PASS 才允许；并完自动核对哈希与仓库干净度）
+python -B $T/integrate.py --store $S --task <task_id> --repo $R
+```
+
+**每一步都不许"看过滤后的输出"**：`bridge_call.py` 强制完整打印 stdout/stderr；它的退出码原样透传。
+
+**这轮的实测结果**：`verify_task` 在 S3-B / S1-C v2 上给 `ready_to_review`、在刻意的缺产物样本上给 `needs_fix`（exit 1）；`integrate` 在真仓库的本地克隆上成功提交（`df6757b`）、重跑给 `no_changes`、对未接收任务 `refused`；`check_contract` 对 4 个模板与 2 个真实契约给 pass/warn（无 problems）。
