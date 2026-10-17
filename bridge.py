@@ -540,6 +540,11 @@ def execute_attempt(directory, task, state, config, expected, attempt_dir, attem
         native_errors = []
         session_id = native["session_id"] if native else None
         native_warnings = []
+        # 2026-10-17 成本账：opencode 的 --format json 每条 step_finish 自带 part.cost 与 part.tokens，
+        # 直接累加成任务级成本；取不到就保持 None，绝不补零。
+        cost_total = 0.0
+        cost_events = 0
+        usage_total = {"input": 0, "output": 0, "reasoning": 0, "cache_read": 0, "cache_write": 0}
         # service 模式探测不到本机 opencode 后台服务时会静默回落 standalone（每任务多付约 1.2s）。
         # 这里把回落显式记成警告与事件，避免“桥变慢了却查不到原因”。
         if (task.get("executor") == "opencode" and task.get("opencode_mode", "service") == "service"
@@ -666,6 +671,16 @@ def execute_attempt(directory, task, state, config, expected, attempt_dir, attem
                                 else:
                                     session_id = observed
                             part = parsed.get("part") or {}
+                            if parsed.get("type") == "step_finish":
+                                cost = part.get("cost")
+                                if isinstance(cost, (int, float)):
+                                    cost_total += float(cost)
+                                    cost_events += 1
+                                tokens = part.get("tokens") or {}
+                                for key in usage_total:
+                                    value = tokens.get(key)
+                                    if isinstance(value, (int, float)):
+                                        usage_total[key] += int(value)
                             tool_state = part.get("state") or {}
                             if tool_state.get("status") == "error":
                                 native_warnings.append({"stage": "tool", "tool": part.get("tool"),
@@ -789,10 +804,14 @@ def execute_attempt(directory, task, state, config, expected, attempt_dir, attem
                   "base_commit": approved["base_commit"],
                   "after_snapshot_sha256": digest(json_bytes(after)) if 'after' in locals() else None,
                   "upstream_requests": None, "usage": native.get("session", {}).get("tokens") if native else None,
-                  # 本机实测 session.get 返回真实 cost 与 tokens，故单列一项；取不到为 None 而不是零。
-                  "native_cost": final_usage,
+                  # 成本账：优先用中断回读的 session.get；否则用 opencode step_finish 的 part.cost 累加；
+                  # 两者都取不到就保持 None（不补零，避免把"没量到"伪装成"免费"）。
+                  "native_cost": final_usage if final_usage is not None else (round(cost_total, 8) if cost_events else None),
+                  "native_cost_source": ("session.get" if final_usage is not None
+                                         else ("opencode:step_finish" if cost_events else None)),
+                  "usage_totals": usage_total if cost_events else None,
                   "stop_outcome": stop_outcome,
-                  "usage_note": "保留原生 JSON 日志；未核实跨执行器 usage 语义，不估算次数或费用"}
+                  "usage_note": "成本来自 opencode step_finish 的 part.cost（或中断回读的 session.get）；取不到为 null，不估算"}
         result["execution_facts"] = facts
         # B 轴：可审准入。此处结果刚写出，稳定性用 stable=True 表达；result_sha256 的占位只为满足
         # "必须已登记结果哈希"这一项，真实哈希在落盘后回填到 state 与 CLI 退出码判定。
