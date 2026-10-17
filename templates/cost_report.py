@@ -71,34 +71,45 @@ def main():
                          "tokens": tokens})
 
     measured = [(r["secs"], r["cost"]) for r in rows if r["cost"] and r["secs"]]
-    rate = float(args.rate) if args.rate not in ("auto", None) else (
-        sum(c for _, c in measured) / sum(s for s, _ in measured) if measured else 0.0)
+    if args.rate not in ("auto", None):
+        rate = float(args.rate)
+    elif measured:
+        rate = sum(c for _, c in measured) / sum(s for s, _ in measured)
+    else:
+        # 没有实测样本时不得凭空造数（项目规则：费用未实证则 null）
+        rate = None
 
     total_secs = total_usd = 0.0
     for r in rows:
-        r["est_usd"] = r["cost"] if r["cost"] is not None else (r["secs"] or 0) * rate
+        if r["cost"] is not None:
+            r["est_usd"] = r["cost"]
+        elif rate is None:
+            r["est_usd"] = None                     # 无法估算 → null，不写 0
+        else:
+            r["est_usd"] = (r["secs"] or 0) * rate
         total_secs += r["secs"] or 0
-        total_usd += r["est_usd"]
+        total_usd += r["est_usd"] or 0.0
         tok = r["tokens"] or {}
         r["tok_in"] = tok.get("input")
         r["tok_out"] = tok.get("output")
         r["tok_reason"] = tok.get("reasoning")
 
-    measured_usd = sum(r["est_usd"] for r in rows if r["cost"] is not None)
-    estimated_usd = sum(r["est_usd"] for r in rows if r["cost"] is None)
+    measured_usd = sum(r["est_usd"] or 0.0 for r in rows if r["cost"] is not None)
+    estimated_usd = sum(r["est_usd"] or 0.0 for r in rows if r["cost"] is None)
     summary = {"attempts": len(rows), "measured": len(measured),
                "measured_attempts": sum(1 for r in rows if r["cost"] is not None),
                "estimated_attempts": sum(1 for r in rows if r["cost"] is None),
                "measured_usd": round(measured_usd, 6),
                "estimated_usd": round(estimated_usd, 6),
-               "rate_usd_per_sec": round(rate, 8),
+               "rate_usd_per_sec": (round(rate, 8) if rate is not None else None),
+               "unestimable_attempts": sum(1 for r in rows if r["est_usd"] is None),
                "total_minutes": round(total_secs / 60, 1),
                "total_usd": round(total_usd, 6), "total_cny": round(total_usd * args.cny, 4),
                "by_store": {}}
     for r in rows:
         b = summary["by_store"].setdefault(r["store"], {"attempts": 0, "usd": 0.0})
         b["attempts"] += 1
-        b["usd"] = round(b["usd"] + r["est_usd"], 6)
+        b["usd"] = round(b["usd"] + (r["est_usd"] or 0.0), 6)
 
     if args.json:
         print(json.dumps({"summary": summary, "rows": rows}, ensure_ascii=False, indent=1))
@@ -106,10 +117,15 @@ def main():
 
     print(f"# 成本看板（{len(rows)} 个 attempt）")
     print()
-    print(f"- 实测计量的 attempt：**{len(measured)}** 个；费率反推 = ${rate:.8f}/s（含思考 token）")
-    print(f"- **实测** ${measured_usd:.4f}（{summary['measured_attempts']} 个 attempt 有 native_cost）"
-          f" ｜ **估算** ${estimated_usd:.4f}（{summary['estimated_attempts']} 个，按墙钟 × 实测费率；"
-          f"墙钟含排队/人工等待，偏高）｜ 合计 ${total_usd:.4f} ≈ ¥{total_usd * args.cny:.2f}")
+    if rate is None:
+        print(f"- 实测计量的 attempt：**{len(measured)}** 个；**无法估算**（无实测样本 → 费用记 null，"
+              "遵守「未实证不造数」；用 `--rate <USD/秒>` 可给出估算）")
+        print(f"- 实测 $0.0000（0 个有 native_cost）｜ 估算 **null**（{summary['estimated_attempts']} 个）")
+    else:
+        print(f"- 实测计量的 attempt：**{len(measured)}** 个；费率反推 = ${rate:.8f}/s（含思考 token）")
+        print(f"- **实测** ${measured_usd:.4f}（{summary['measured_attempts']} 个 attempt 有 native_cost）"
+              f" ｜ **估算** ${estimated_usd:.4f}（{summary['estimated_attempts']} 个，按墙钟 × 实测费率；"
+              f"墙钟含排队/人工等待，偏高）｜ 合计 ${total_usd:.4f} ≈ ¥{total_usd * args.cny:.2f}")
     print(f"- 总时长 {total_secs/60:.1f} 分钟")
     print()
     print("| 账本 | attempt | 估算(USD) |")

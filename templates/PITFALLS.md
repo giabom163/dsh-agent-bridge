@@ -65,3 +65,4 @@
 | R3 | 一次 404 就吃掉一个模型槽位 | `request_once` 把该槽记成 `uncertain` 并**永久阻塞**（不重发，这是对的） | 先确认夹具能命中（`--match model` 或核对 body）再跑真实链路 |
 | R4 | `prune --apply` 会删掉正在用的 workspace | 保留规则只认 `state.json` 的 `current_attempt`，accepted 任务的旧 attempt 会被删；未知状态落到"全删" | 已重写：**默认什么都不删**；未知状态一律保留并告警；`--protect` 保护指定路径；删除逐条核实 |
 | R5 | 报告里的数字"无据可查" | 只在控制台打印、没落盘 | 生成证据文件（`--save`）并报告里写 sha256；没有落盘证据的一律记"待重验" |
+| R6 | 接收被拒：`回收后工作区又被修改` | 我把功能测试跑在**证据 worktree 里**，工具把 `events/` 产物写进 worktree，桥的接收守卫发现工作区与执行时不一致 | 功能测试一律在**副本**里跑；若已污染，先把产物拷到 `_s4/functional-run/`，再删掉 worktree 里的产物与 `__pycache__`，`git status` 只剩应有改动后再接收 |
